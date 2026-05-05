@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ligong"
+version = "1.0.0"
+description = "力工 Code – Local Developer Agent"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "openai",
+    "rich",
+    "pexpect",
+    "flask",
+    "playwright",
+    "requests",
+]
+
+[project.scripts]
+lg = "agent:main"
+
+[tool.setuptools]
+py-modules = ["agent", "bridge"]
+packages = ["agent_tools"]

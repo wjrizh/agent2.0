@@ -1,0 +1,6 @@
+openai
+rich
+pexpect
+flask
+playwright
+requests

@@ -1,0 +1,12 @@
+Metadata-Version: 2.4
+Name: ligong
+Version: 1.0.0
+Summary: 力工 Code – Local Developer Agent
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+Requires-Dist: openai
+Requires-Dist: rich
+Requires-Dist: pexpect
+Requires-Dist: flask
+Requires-Dist: playwright
+Requires-Dist: requests

@@ -1,0 +1,54 @@
+# 忽略 Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 忽略虚拟环境
+venv/
+env/
+.env/
+
+# 忽略本地配置和环境变量（保护你的 API Key）
+.env
+state.json
+.env.local
+
+# 忽略之前的本地备份文件夹
+backups/
+
+# 忽略日志文件
+agent_tools.log
+*.log
+
+# 忽略编辑器配置
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 忽略操作系统文件
+.DS_Store
+Thumbs.db
+
+# 忽略浏览器数据目录
+dp_user_data/
+
+# 忽略工作目录
+workspace/
+
+# 忽略测试输出
+.pytest_cache/
+.tox/
+
+# 忽略安装包
+*.deb
+
+# 忽略游戏相关文件
+highscore.txt
+snake_game.py
+login_and_save.py
+start_wang.sh
+
+# 忽略邮箱本地配置文件
+.email_profiles.json
