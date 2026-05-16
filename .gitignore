@@ -52,3 +52,10 @@ start_wang.sh
 
 # 忽略邮箱本地配置文件
 .email_profiles.json
+
+# 忽略 agent 任务锁文件
+.agent_tasks.json
+.~lock.*#
+
+# 忽略 egg-info 构建产物
+ligong.egg-info/

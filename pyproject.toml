@@ -15,6 +15,7 @@ dependencies = [
     "flask",
     "playwright",
     "requests",
+    "prompt_toolkit",
 ]
 
 [project.scripts]

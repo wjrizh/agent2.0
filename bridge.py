@@ -127,7 +127,7 @@ def init_browser():
             sys.exit(1)
 
         # 有登录状态，正常无头启动
-        BROWSER = PLAYWRIGHT.chromium.launch(headless=True)
+        BROWSER = PLAYWRIGHT.chromium.launch(headless=False)
         CONTEXT = BROWSER.new_context(storage_state=state_file)
         PAGE = CONTEXT.new_page()
         PAGE.goto("https://chat.deepseek.com/", wait_until="domcontentloaded", timeout=60000)
@@ -302,8 +302,8 @@ def delete_chat():
     """接收 agent 退出时的信号，执行动态监听删除"""
     print("\n>>> [BRIDGE] 收到清理指令，正在销毁本次对话...")
     try:
-        # 1. 找到左侧历史记录
-        history_link = PAGE.locator("a[href*='/a/chat/s/']").first
+        # 1. 找到左侧历史记录（兼容多种 URL 模式）
+        history_link = PAGE.locator("a[href*='/a/chat/s/'], a[href*='/chat/']").first
         history_link.wait_for(state="visible", timeout=3000)
         history_link.hover()
 
@@ -320,7 +320,8 @@ def delete_chat():
         delete_menu_item.click()
 
         # 4. 动态等待二次确认弹窗出现并点击，【拒绝 time.sleep】
-        confirm_btn = PAGE.locator("button").filter(has_text=re.compile(r"^删除$|^确认$|^Confirm$")).last
+        # DeepSeek 确认按钮文本为 "删除该对话"，不是单纯的"删除"
+        confirm_btn = PAGE.locator("button").filter(has_text=re.compile(r"删除|确认|Confirm|Delete")).last
         confirm_btn.wait_for(state="visible", timeout=2000)
         confirm_btn.click()
         

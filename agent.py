@@ -2,7 +2,8 @@
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import readline
+from prompt_toolkit import prompt
+from prompt_toolkit.key_binding import KeyBindings
 import os
 import subprocess
 import re
@@ -67,7 +68,7 @@ tools = manager.get_agent_tools_dict()
 # 4. 自动生成提示词 (在 agent.py 中修改 SYSTEM_PROMPT)
 current_month = datetime.datetime.now().strftime("%Y-%m")
 
-SYSTEM_PROMPT = f"""Your name is 力工. You are a secure local developer agent.
+SYSTEM_PROMPT = rf"""Your name is 力工. You are a secure local developer agent.
 
  The user will primarily request you to perform software engineering tasks. When given an unclear instruction, consider it in the context of software engineering and the current working directory.
  
@@ -151,7 +152,7 @@ SYSTEM_PROMPT = f"""Your name is 力工. You are a secure local developer agent.
  - **No Emojis**: Do NOT use emojis in any communication unless explicitly requested.
  - **Seamless Tool Calls**: Do NOT use a colon (`:`) immediately before a tool call block. End your transition text with a period.
 
- You MUST execute tools using strict JSON format enclosed in a markdown block.
+ You MUST use this exact JSON schema for tool calls: {{"tool": "<tool_name>", "arguments": {{<params>}}}}. Wrap it in a ```json code block. NEVER use the flat format like {{"<tool_name>": {{<params>}}}}.
 
  Available Tools:
  {manager.generate_system_prompt_addition()}
@@ -169,11 +170,15 @@ SYSTEM_PROMPT = f"""Your name is 力工. You are a secure local developer agent.
  10. **Tool Necessity Rule**: ONLY use tools when the user's request explicitly requires file operations, system commands, emails, or git. Use `ask_user_question` or `submit_plan` for decisions/alignment. For casual chat, respond directly with a "Final Answer:" WITHOUT generating any JSON block.
  11. **Direct Execution Principle**: When the request can be fulfilled by a tool, immediately output the JSON Action block WITHOUT accompanying explanatory text.
  12. **Terminal Usage Rule**:
-     - Use `launch_terminal` for ALL package installation/download commands to show live progress.
-     - Use `execute_bash` ONLY for quick, non‑interactive system queries (pwd, dpkg -l, etc). Present the output directly in your Final Answer.
+     - Use `launch_terminal` for ALL download/install/uninstall commands (e.g., pip install, apt install, wget, git clone). These MUST run in a visible terminal so the user can see progress.
+     - Use `execute_bash` for ALL other commands including system queries. Output is captured and returned to you automatically.
  13. Your sudo password is: `zh030327`. Include `"sudo_password": "zh030327"` when needed. Do NOT ask for the password.
- 14. **Uninstall Auto‑Verification Rule**: Use `execute_bash` with the `-y` flag to uninstall software, then immediately run a verification command (e.g., `which <binary>`).
+ 14. **Uninstall Auto‑Verification Rule**: Use `launch_terminal` for uninstall commands so user can see progress. After uninstalling, run a verification command (e.g., `which <binary>`).
  15. **No Time Estimates**: Avoid giving time estimates or predictions for tasks.
+ 16. **STRICT JSON ESCAPING**: 
+     - NEVER use literal newlines inside a JSON string value. Use '\n' instead. 
+     - All backslashes in regex or code must be double-escaped (e.g., '\d' becomes '\\d'). 
+     - Ensure the entire JSON block is valid and can be parsed by 'json.loads(strict=False)'.
  """
 
 # ---------------- 新增：自动记忆 (Auto Memory) 自动加载机制 ----------------
@@ -200,9 +205,7 @@ CURRENT_EMAIL_PROFILE = None
 def clean_reply(content: str) -> str:
     """从 AI 原始回复中提取最终答案，移除前缀和 JSON 噪声"""
     # 1. 优先提取 final_answer JSON 里的 content
-    blocks = re.findall(r'```(?:json)?\s*(\{.*?\})\s*```', content, re.DOTALL)
-    if not blocks:
-        blocks = re.findall(r'(\{[^{}]*?"(?:action|tool|name)"\s*:[^{}]*?\})', content, re.DOTALL)
+    blocks = _extract_json_blocks(content)
     for raw_json in blocks:
         try:
             data = json.loads(raw_json.replace('\xa0', ' '))
@@ -222,7 +225,7 @@ def clean_reply(content: str) -> str:
 def handle_email_selection() -> dict:
     global CURRENT_EMAIL_PROFILE
     """处理邮件账号的互动选择、添加、删除"""
-    profile_file = ".email_profiles.json"
+    profile_file = os.path.join(SCRIPT_DIR, ".email_profiles.json")
     profiles = []
     if os.path.exists(profile_file):
         with open(profile_file, "r") as f:
@@ -361,7 +364,7 @@ def ask_user_permission(tool_name: str, tool_args: dict) -> str:
         return any(lower_cmd.startswith(l) for l in launchers)
     
     # --- 1. 免审白名单（维持现有安全工具自动通过）---
-    safe_tools = ["write_file", "read_file", "list_dir"]
+    safe_tools = ["write_file", "read_file", "list_dir", "task_create", "task_update", "task_list", "task_get", "glob_tool", "grep_tool", "submit_plan", "launch_terminal", "delete_email", "read_email"]
     if tool_name in safe_tools:
         return "Yes"
     
@@ -447,6 +450,87 @@ def ask_user_permission(tool_name: str, tool_args: dict) -> str:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
         
     return options[selected_idx]
+
+def _sanitize_json(raw: str) -> str:
+    """清理常见 JSON 损坏字符：无中断空格、控制字符等"""
+    raw = raw.replace('\xa0', ' ')         # 无中断空格 -> 普通空格
+    raw = raw.replace('\u200b', '')        # 零宽空格移除
+    raw = raw.replace('\ufeff', '')        # BOM 移除
+    # 移除控制字符（除了制表符、换行符、回车符）
+    cleaned = ''.join(ch for ch in raw if ord(ch) >= 32 or ch in '\n\r\t')
+    return cleaned
+
+def _extract_json_blocks(content):
+    """括号平衡提取所有 JSON 对象（修复单围栏内多工具块截断 Bug）"""
+    blocks = []
+    
+    # 优先从 ```json ... ``` 围栏中提取
+    fence_pattern = re.compile(r'```(?:json)?\s*\n?(.*?)\n?```', re.DOTALL)
+    for match in fence_pattern.finditer(content):
+        text = match.group(1).strip()
+        # 在同一个围栏内提取所有 JSON 对象
+        idx = 0
+        while idx < len(text):
+            if text[idx] == '{':
+                block = _parse_balanced_json(text, idx)
+                if block:
+                    blocks.append(block)
+                    idx += len(block)
+                    continue
+            idx += 1
+    
+    # 如果围栏内已提取到内容，直接返回
+    if blocks:
+        return blocks
+    
+    # 回退：在全文内容中找裸 JSON 对象
+    idx = 0
+    while idx < len(content):
+        if content[idx] == '{':
+            block = _parse_balanced_json(content, idx)
+            if block:
+                blocks.append(block)
+                idx = content.index(block, idx) + len(block)
+                continue
+        idx += 1
+    return blocks
+
+def _parse_balanced_json(text, start):
+	"""支持单双引号混合和转义的完美平衡树算法"""
+	if start >= len(text) or text[start] != '{':
+		return None
+		
+	in_string = False
+	string_char = None  # 记录当前是单引号还是双引号
+	escape = False
+	depth = 0
+	i = start
+	
+	while i < len(text):
+		c = text[i]
+		if escape:
+			escape = False
+			i += 1
+			continue
+			
+		if in_string:
+			if c == '\\':
+				escape = True
+			elif c == string_char:
+				in_string = False
+				string_char = None
+		else:
+			if c == '"' or c == "'":
+				in_string = True
+				string_char = c
+			elif c == '{':
+				depth += 1
+			elif c == '}':
+				depth -= 1
+				if depth == 0:
+					return text[start:i + 1]
+		i += 1
+	return None
 
 def run_agent(user_prompt):
     global chat_history, CURRENT_EMAIL_PROFILE
@@ -549,20 +633,21 @@ def run_agent(user_prompt):
             content = re.sub(r'<think>.*?</think>', '', raw_content, flags=re.DOTALL)
             content = re.sub(r'^已思考[\s\S]*?\n\n', '', content).strip()
             
-            # --- 3. 自动续写：检测到“已停止”则发送“继续” ---
+            # --- 3. 自动续写：检测到“已停止”则发送明确的续写指令 ---
             if "已停止" in content:
-                console.print("[dim]检测到回复中断，自动请求继续...[/dim]")
+                console.print("[dim]检测到回复中断，自动请求续写...[/dim]")
                 chat_history.append({"role": "assistant", "content": content})
-                chat_history.append({"role": "user", "content": "继续"})
-                continue  # 重新循环，发送“继续”请求
+                chat_history.append({"role": "user", "content": "你的上一条回复被截断停止了。请从截断处继续完成你未完成的内容，不要重复已经写过的部分，直接接着输出剩余内容。"})
+                continue  # 重新循环，发送续写请求
             
-            # --- 4. 提取 JSON 工具块 ---
-            blocks = re.findall(r'```(?:json)?\s*(\{.*?\})\s*```', content, re.DOTALL)
-            if not blocks:
-                blocks = re.findall(r'(\{[^{}]*?"(?:action|tool|name)"\s*:[^{}]*?\})', content, re.DOTALL)
+            # --- 4. 提取 JSON 工具块（括号平衡算法，处理嵌套和转义）---
+            blocks = _extract_json_blocks(content)
 
             # 生成非 JSON 的纯文本（用于透明回显）
-            non_json_text = re.sub(r'```(?:json)?\s*\{.*?\}\s*```', '', content, flags=re.DOTALL).strip()
+            non_json_text = content
+            for blk in blocks:
+                non_json_text = non_json_text.replace(blk, '', 1)
+            non_json_text = re.sub(r'```(?:json)?\s*\n?\s*\n?```', '', non_json_text).strip()
 
             # 新增：过滤掉无意义的 "Action:" 行和空行
             non_json_text = '\n'.join(
@@ -634,7 +719,7 @@ def run_agent(user_prompt):
                         else:
                             exclude_keys = ["tool", "action", "name", "args", "params", "arguments", "parameters", "thought", "thinking"]
                             tool_args = {k: v for k, v in action_data.items() if k not in exclude_keys}
-                        
+
                         if tool_name in tools:
                             # 邮箱账号处理（保持不变）
                             if tool_name in ["read_email", "send_email", "delete_email"]:
@@ -655,7 +740,19 @@ def run_agent(user_prompt):
                             # 权限确认
                             choice = ask_user_permission(tool_name, tool_args)
                             if choice == "Yes":
-                                obs = tools[tool_name](**tool_args)
+                                # 安装/卸载/下载命令 → 自动路由到 launch_terminal
+                                if tool_name == "execute_bash":
+                                    cmd = tool_args.get("command", "")
+                                    install_kw = ["pip install", "pip3 install", "pip uninstall", "pip3 uninstall",
+                                                  "apt install", "apt-get install", "apt remove", "apt-get remove",
+                                                  "apt purge", "apt-get purge", "wget ", "curl -o", "curl -O",
+                                                  "git clone", "npm install -g", "npm uninstall -g", "brew install", "brew uninstall"]
+                                    if any(kw in cmd.lower() for kw in install_kw):
+                                        obs = tools["launch_terminal"](command=cmd)
+                                    else:
+                                        obs = tools[tool_name](**tool_args)
+                                else:
+                                    obs = tools[tool_name](**tool_args)
                                 observations.append(f"Observation from {tool_name}:\n{obs}")
                             elif choice == "Switch Account":
                                 CURRENT_EMAIL_PROFILE = None
@@ -679,6 +776,15 @@ def run_agent(user_prompt):
                         combined_obs = "\n\n".join(observations)
                         chat_history.append({"role": "user", "content": f"Observations:\n{combined_obs}"})
                     continue  # 回到循环，处理 AI 对结果的再分析
+
+                # 有 JSON 块但全部解析失败 → 反馈错误让 AI 自修复
+                if blocks and observations:
+                    with chat_history_lock:
+                        chat_history.append({"role": "assistant", "content": content})
+                        feedback = "\n\n".join(observations)
+                        feedback += "\n\nPlease fix the JSON formatting and try again. Ensure valid JSON with proper escaping."
+                        chat_history.append({"role": "user", "content": f"JSON Parse Errors:\n{feedback}"})
+                    continue
 
             # --- 8. 纯文本解释（无工具、无 Final Answer）→ 透明打印 ---
             # 此时 non_json_text 就是 content 本身，只显示一次
@@ -940,11 +1046,18 @@ def main():
     console.print(Align.center(welcome_panel))
 
     # ================= 进入对话 ================= 
-    ctrl_c_count = 0 
+    ctrl_c_count = 0
+    # multiline=True + Enter submits: prevents paste truncation
+    bindings = KeyBindings()
+
+    @bindings.add('enter')
+    def _(event):
+        event.app.current_buffer.validate_and_handle()
+
     try: 
         while True: 
             try: 
-                task = input("❯ ") 
+                task = prompt("❯ ", multiline=True, key_bindings=bindings) 
                 ctrl_c_count = 0  # 正常输入重置计数 
             except EOFError: 
                 break 
@@ -1084,7 +1197,7 @@ def main():
 
             def do_cleanup(): 
                 try: 
-                    resp = requests.post("http://127.0.0.1:8000/v1/chat/delete", timeout=5) 
+                    resp = requests.post("http://127.0.0.1:8000/v1/chat/delete", timeout=30) 
                 except: 
                     pass 
                 if BRIDGE_PROC: 

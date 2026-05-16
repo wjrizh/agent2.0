@@ -96,6 +96,19 @@ class ExecuteBashTool(BaseTool):
                 return True
             if any(kw in lower_cmd for kw in ["serve", "daemon", "--watch"]):
                 return True
+            # 安装/卸载/大文件下载 → 必须弹出终端
+            install_uninstall_kw = [
+                "pip install", "pip3 install", "pip uninstall", "pip3 uninstall",
+                "apt install", "apt-get install", "apt remove", "apt-get remove",
+                "apt purge", "apt-get purge", "yum install", "yum remove",
+                "dnf install", "dnf remove", "brew install", "brew uninstall",
+                "npm install -g", "npm i -g", "npm uninstall -g", "npm remove -g",
+                "cargo install", "cargo uninstall", "gem install", "gem uninstall",
+                "snap install", "snap remove", "wget ", "curl -o", "curl -O",
+                "git clone"
+            ]
+            if any(kw in lower_cmd for kw in install_uninstall_kw):
+                return True
             return False
 
         if _must_use_terminal(command):
@@ -106,47 +119,39 @@ class ExecuteBashTool(BaseTool):
             )
 
         try:
-            if not sudo_password or "sudo " not in command:
+            wrapped_command = command
+            # 强制非交互模式，防止 debconf/dpkg 等弹出交互提示导致永久阻塞
+            wrapped_command = f"export DEBIAN_FRONTEND=noninteractive; {command}"
+            
+            if sudo_password and "sudo " in command:
+                # 将 sudo 替换为 sudo -S 以便通过 stdin 注入密码
+                wrapped_command = f"export DEBIAN_FRONTEND=noninteractive; {command.replace('sudo ', 'sudo -S ')}"
                 result = subprocess.run(
-                    command,
+                    wrapped_command,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.timeout,
+                    input=sudo_password + "\n"
+                )
+            else:
+                result = subprocess.run(
+                    wrapped_command,
                     shell=True,
                     capture_output=True,
                     text=True,
                     timeout=self.timeout
                 )
-                out = result.stdout.strip()
-                err = result.stderr.strip()
-                if not out and not err:
-                    return "Command executed successfully (no output)."
-                output = []
-                if out: output.append(f"STDOUT:\n{out}")
-                if err: output.append(f"STDERR:\n{err}")
-                return "\n".join(output)
-            
-            # pexpect 处理 sudo
-            child = pexpect.spawn(f'/bin/bash -c "{command}"', encoding='utf-8', timeout=self.timeout)
-            while True:
-                index = child.expect([
-                    r'\[sudo\] password for',
-                    r'Sorry, try again',
-                    pexpect.EOF,
-                    pexpect.TIMEOUT
-                ])
-                if index == 0:
-                    child.sendline(sudo_password)
-                elif index == 1:
-                    child.close()
-                    return "Error: Sudo password incorrect."
-                else:
-                    break
-            child.timeout = 30
-            output = child.read()
-            child.close()
-            if child.exitstatus != 0:
-                return f"Error: Command exited with status {child.exitstatus}.\nOutput:\n{output}"
-            return f"Command executed successfully.\nOutput:\n{output}"
+            out = result.stdout.strip()
+            err = result.stderr.strip()
+            if not out and not err:
+                return "Command executed successfully (no output)."
+            output = []
+            if out: output.append(f"STDOUT:\n{out}")
+            if err: output.append(f"STDERR:\n{err}")
+            return "\n".join(output)
 
-        except pexpect.TIMEOUT:
+        except subprocess.TimeoutExpired:
              return f"Error: Command timed out after {self.timeout} seconds."
         except Exception as e:
             return f"Execution Error: {str(e)}"
@@ -430,9 +435,9 @@ class WebSearchTool(BaseTool):
 
     def run(self, query: str) -> str:
         try:
-            from duckduckgo_search import DDGS
+            from ddgs import DDGS
         except ImportError:
-            return "Error: The 'duckduckgo-search' package is missing. Please use 'execute_bash' to run `pip install duckduckgo-search` first, then try your search again."
+            return "Error: The 'ddgs' package is missing. Please use 'execute_bash' to run `pip install ddgs` first, then try your search again."
         
         try:
             with DDGS() as ddgs:
@@ -457,13 +462,14 @@ class ReadEmailTool(BaseTool):
         "required": [],
         "properties": {
             "count": {"type": "integer", "description": "Number of recent emails to fetch. Default is 3."},
+            "offset": {"type": "integer", "description": "Skip the N most recent emails, then read 'count' emails. Default 0 means start from the latest."},
             "imap_server": {"type": "string", "description": "Injected by system"},
             "username": {"type": "string", "description": "Injected by system"},
             "app_password": {"type": "string", "description": "Injected by system"}
         }
     }
 
-    def run(self, imap_server: str = "", username: str = "", app_password: str = "", count: int = 3) -> str:
+    def run(self, imap_server: str = "", username: str = "", app_password: str = "", count: int = 3, offset: int = 0) -> str:
         if not app_password:
             return "Error: System failed to inject credentials."
             
@@ -489,7 +495,11 @@ class ReadEmailTool(BaseTool):
             if status != "OK": return "Failed to search emails."
 
             email_ids = messages[0].split()
-            recent_ids = email_ids[-count:]
+            total_skip = count + offset
+            if offset > 0:
+                recent_ids = email_ids[-total_skip:-offset]
+            else:
+                recent_ids = email_ids[-count:]
             
             result_text = []
             for e_id in reversed(recent_ids):
@@ -992,6 +1002,7 @@ class TaskGetTool(BaseTool):
             return f"Error reading task: {e}"
 
 # ----------------- 新增：交互式提问工具 (AskUserQuestion) -----------------
+# ----------------- 修复版：交互式提问工具 (AskUserQuestion) -----------------
 class AskUserQuestionTool(BaseTool):
     name = "ask_user_question"
     description = "Ask the user questions during execution to gather preferences, clarify ambiguous instructions, or get decisions on implementation choices."
@@ -1008,54 +1019,138 @@ class AskUserQuestionTool(BaseTool):
     }
 
     def run(self, question: str, options: list, multi_select: bool = False, previews: dict = None) -> str:
-        # 在终端渲染交互菜单
-        print(f"\n\033[1;33m[力工 提问]\033[0m \033[1m{question}\033[0m")
-        for i, opt in enumerate(options):
-            print(f"  \033[1;36m{i + 1}.\033[0m {opt}")
-            # 如果有预览，渲染预览块
-            if previews and str(i) in previews:
-                preview_text = previews[str(i)]
-                print(f"      \033[2m--- Preview ---\n      {preview_text.replace(chr(10), chr(10)+'      ')}\n      ---------------\033[0m")
-        
-        # 自动增加 Other 选项
-        other_idx = len(options) + 1
-        print(f"  \033[1;36m{other_idx}.\033[0m Other (custom input)")
-        
-        prompt_text = "  (Multi-select: commas allowed, or type text) ❯ " if multi_select else "  (Enter number or type text) ❯ "
-        
-        try:
-            sys.stdout.flush()
-            user_input = input(f"\n{prompt_text}").strip()
-            
-            if multi_select:
-                parts = [p.strip() for p in user_input.split(",")]
-                answers = []
-                for p in parts:
-                    if p.isdigit():
-                        idx = int(p)
-                        if 1 <= idx <= len(options):
-                            answers.append(options[idx - 1])
-                        elif idx == other_idx:
-                            custom = input("  Please specify 'Other': ").strip()
-                            answers.append(f"Other: {custom}")
-                        else:
-                            answers.append(p)
-                    else:
-                        answers.append(p)
-                return "User selected: " + ", ".join(answers)
-            else:
-                if user_input.isdigit():
-                    idx = int(user_input)
-                    if 1 <= idx <= len(options):
-                        return f"User selected: {options[idx - 1]}"
-                    elif idx == other_idx:
-                        custom = input("  Please specify 'Other': ").strip()
-                        return f"User selected: Other: {custom}"
-                # 如果用户直接输入了文字，当做自定义文本返回
-                return f"User selected/answered: {user_input}"
-        except Exception as e:
-            return f"Error receiving user input: {e}"
+        import termios
+        import tty
+        import sys
 
+        display_options = list(options) + ["Other (custom input)"]
+        NL = "\r\n"
+
+        # === 核心修复点 1：把长文本问题剥离出刷新循环，只打印一次，让终端自己处理折行 ===
+        sys.stdout.write(f"{NL}\033[1;33m[力工 提问]\033[0m \033[1m{question}\033[0m{NL}{NL}")
+        sys.stdout.flush()
+
+        _menu_line_count = 0
+
+        def draw_options(selected_idx, checked_set=None):
+            for i, opt in enumerate(display_options):
+                if multi_select:
+                    checked = "✓" if checked_set and i in checked_set else " "
+                    prefix = f"[{checked}] "
+                else:
+                    prefix = ""
+                
+                # === 核心修复点 2：截断过长的选项显示（仅显示阶段），防止菜单本身折行 ===
+                display_text = opt if len(opt) < 70 else opt[:67] + "..."
+                
+                if i == selected_idx:
+                    sys.stdout.write(f"  \033[92m> {prefix}{display_text}\033[0m{NL}")
+                else:
+                    sys.stdout.write(f"    {prefix}{display_text}{NL}")
+
+        def draw_preview(selected_idx):
+            if previews and str(selected_idx) in previews:
+                preview_text = previews[str(selected_idx)]
+                sys.stdout.write(f"{NL}  \033[2m--- Preview ---{NL}      {preview_text.replace(chr(10), chr(10)+'      ')}{NL}  ---------------\033[0m{NL}")
+            else:
+                sys.stdout.write(NL)
+
+        def draw_footer():
+            if multi_select:
+                sys.stdout.write(f"{NL}  \033[2m(↑↓: navigate, Space: toggle, Enter: confirm, Ctrl+C: cancel)\033[0m")
+            else:
+                sys.stdout.write(f"{NL}  \033[2m(↑↓: navigate, Enter: select, Ctrl+C: cancel)\033[0m")
+
+        def refresh(selected_idx, checked_set=None):
+            nonlocal _menu_line_count
+
+            # 1. 光标上移 _menu_line_count 行，并使用 \033[J 清除屏幕下方所有旧残影
+            if _menu_line_count > 0:
+                sys.stdout.write(f"\r\033[{_menu_line_count}A\033[J")
+            else:
+                sys.stdout.write("\r\033[J")
+
+            # 2. 临时劫持 stdout 精确计算行数
+            output_buffer = []
+            old_write = sys.stdout.write
+            def capture_write(s):
+                output_buffer.append(s)
+
+            sys.stdout.write = capture_write
+            try:
+                # 注意：这里不再绘制 Header (question)
+                draw_options(selected_idx, checked_set)
+                draw_preview(selected_idx)
+                draw_footer()
+            finally:
+                sys.stdout.write = old_write
+
+            # 3. 统计换行符数量更新状态，一次性输出全部画面
+            full_output = "".join(output_buffer)
+            _menu_line_count = full_output.count('\n')
+            sys.stdout.write(full_output)
+            sys.stdout.flush()
+
+        try:
+            fd = sys.stdin.fileno()
+            old_settings = termios.tcgetattr(fd)
+            tty.setraw(fd)
+
+            selected_idx = 0
+            checked_set = set()
+            refresh(selected_idx, checked_set)
+
+            while True:
+                char = sys.stdin.read(1)
+                if char == '\x1b':
+                    c2 = sys.stdin.read(1)
+                    c3 = sys.stdin.read(1)
+                    if c2 == '[':
+                        if c3 == 'A':  # 上
+                            selected_idx = (selected_idx - 1) % len(display_options)
+                        elif c3 == 'B':  # 下
+                            selected_idx = (selected_idx + 1) % len(display_options)
+                        refresh(selected_idx, checked_set)
+                elif char == ' ' and multi_select:
+                    if selected_idx in checked_set:
+                        checked_set.discard(selected_idx)
+                    else:
+                        checked_set.add(selected_idx)
+                    refresh(selected_idx, checked_set)
+                elif char == '\r':
+                    sys.stdout.write("\r\n")
+                    sys.stdout.flush()
+                    break
+                elif char == '\x03':
+                    sys.stdout.write("\r\n")
+                    sys.stdout.flush()
+                    return "User cancelled"
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+        if multi_select:
+            if not checked_set:
+                return "User selected: (nothing)"
+            answers = []
+            has_other = False
+            for idx in sorted(checked_set):
+                if idx == len(display_options) - 1:
+                    has_other = True
+                else:
+                    answers.append(options[idx])
+            if has_other:
+                from prompt_toolkit import prompt
+                other_custom = prompt("\n  Please specify 'Other': ").strip()
+                if other_custom:
+                    answers.append(f"Other: {other_custom}")
+            return "User selected: " + ", ".join(answers)
+        else:
+            if selected_idx == len(display_options) - 1:
+                from prompt_toolkit import prompt
+                custom = prompt("\n  Please specify 'Other': ").strip()
+                return f"User selected: Other: {custom}"
+            else:
+                return f"User selected: {options[selected_idx]}"
 # ----------------- 新增：内存定时任务 (Cron Scheduling) -----------------
 import time
 
@@ -1156,8 +1251,8 @@ class SubmitPlanTool(BaseTool):
         print(f"\033[37m{plan}\033[0m")
         
         try:
-            sys.stdout.flush()
-            user_input = input("\n  ❯ Do you approve this plan? (Press Enter to approve, or type your modifications) : ").strip()
+            from prompt_toolkit import prompt
+            user_input = prompt("\n  ❯ Do you approve this plan? (Press Enter to approve, or type your modifications) : ").strip()
             
             if not user_input or user_input.lower() in ['y', 'yes', 'ok', 'approve']:
                 return "User approved the plan. You may proceed with execution."
