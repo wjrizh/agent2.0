@@ -167,9 +167,18 @@ def clean_reply(content: str) -> str:
     blocks = _extract_json_blocks(content)
     for raw_json in blocks:
         try:
-            data = json.loads(raw_json.replace('\xa0', ' '))
-            if data.get("action") == "final_answer" or data.get("tool") == "final_answer":
-                return data.get("content") or data.get("answer") or data.get("text", "")
+            raw_json = _sanitize_json(raw_json)
+            try:
+                raw_json = _escape_newlines_in_json_strings(raw_json)
+            except NameError:
+                pass
+                
+            data = json.loads(repair_json(raw_json))
+            # 兼容 json_repair 将多个对象组合成 List 的情况
+            actions = data if isinstance(data, list) else [data]
+            for act in actions:
+                if isinstance(act, dict) and (act.get("action") == "final_answer" or act.get("tool") == "final_answer"):
+                    return act.get("content") or act.get("answer") or act.get("text", "")
         except:
             pass
 
@@ -422,30 +431,62 @@ def _sanitize_json(raw: str) -> str:
     raw = raw.replace('\ufeff', '')        # BOM 移除
     return raw
 
+# ---------------- 新增：修复大模型未转义换行符 ----------------
+def _escape_newlines_in_json_strings(raw_json: str) -> str:
+    """
+    智能预处理 JSON 字符串，将多行双引号/单引号内部的物理换行符转义为 \\n。
+    防止 json_repair 将带有物理换行的字符串截断并把后续代码误认为新的 JSON 键值对。
+    """
+    in_string = False
+    string_char = None
+    escape = False
+    result = []
+    
+    for c in raw_json:
+        if escape:
+            escape = False
+            result.append(c)
+            continue
+            
+        if in_string:
+            if c == '\\':
+                escape = True
+                result.append(c)
+            elif c == string_char:
+                in_string = False
+                string_char = None
+                result.append(c)
+            elif c == '\n':
+                result.append('\\n')
+            elif c == '\r':
+                result.append('\\r')
+            elif c == '\t':
+                result.append('\\t')
+            else:
+                result.append(c)
+        else:
+            if c == '"' or c == "'":
+                in_string = True
+                string_char = c
+            result.append(c)
+    return "".join(result)
+
 def _extract_json_blocks(content):
-    """括号平衡提取所有 JSON 对象（修复单围栏内多工具块截断 Bug）"""
+    """修复版：整体提取代码围栏内容，绝对禁止在围栏内使用括号匹配提前截断"""
     blocks = []
     
-    # 优先从 ```json ... ``` 围栏中提取
+    # 1. 优先从 ```json ... ``` 围栏中提取全部内容（将整个块视为一个完整的待解析实体）
     fence_pattern = re.compile(r'```(?:json)?\s*\n?(.*?)\n?```', re.DOTALL)
     for match in fence_pattern.finditer(content):
         text = match.group(1).strip()
-        # 在同一个围栏内提取所有 JSON 对象
-        idx = 0
-        while idx < len(text):
-            if text[idx] == '{':
-                block = _parse_balanced_json(text, idx)
-                if block:
-                    blocks.append(block)
-                    idx += len(block)
-                    continue
-            idx += 1
+        if text:
+            blocks.append(text)
     
-    # 如果围栏内已提取到内容，直接返回
+    # 如果提取到了代码块，直接返回。让后续的 json_repair 处理完整的字符串，它有足够的智慧处理不平衡！
     if blocks:
         return blocks
     
-    # 回退：在全文内容中找裸 JSON 对象
+    # 2. 回退机制：全文无围栏时，继续用括号提取裸露的 JSON
     idx = 0
     while idx < len(content):
         if content[idx] == '{':
@@ -629,11 +670,21 @@ def run_agent(user_prompt):
             final_answer_json = None
             for raw_json in blocks:
                 try:
-                    raw_json = raw_json.replace('\xa0', ' ')
+                    # 替换原有的 replace('\xa0', ' ')
+                    raw_json = _sanitize_json(raw_json)
+                    try:
+                        raw_json = _escape_newlines_in_json_strings(raw_json)
+                    except NameError:
+                        pass
                     repaired_json_str = repair_json(raw_json)
                     data = json.loads(repaired_json_str)
-                    if data.get("action") == "final_answer" or data.get("tool") == "final_answer":
-                        final_answer_json = data.get("content") or data.get("answer") or data.get("text", "")
+                    # 兼容 json_repair 将多个对象组合成 List 的情况
+                    actions = data if isinstance(data, list) else [data]
+                    for act in actions:
+                        if isinstance(act, dict) and (act.get("action") == "final_answer" or act.get("tool") == "final_answer"):
+                            final_answer_json = act.get("content") or act.get("answer") or act.get("text", "")
+                            break
+                    if final_answer_json:
                         break
                 except:
                     pass
@@ -668,79 +719,99 @@ def run_agent(user_prompt):
 
                 for raw_json in blocks:
                     try:
-                        raw_json = raw_json.replace('\xa0', ' ')
-                        # 核心修复：先用 repair_json 擦除物理换行符等非法字符
+                        raw_json = _sanitize_json(raw_json)
+                        try:
+                            raw_json = _escape_newlines_in_json_strings(raw_json)
+                        except NameError:
+                            pass
+                            
                         repaired_json_str = repair_json(raw_json)
                         action_data = json.loads(repaired_json_str, strict=False)
-                        if not (isinstance(action_data, dict) and any(k in action_data for k in ["tool", "action", "name"])):
-                            continue
-                        executed_any = True
-                        tool_name = action_data.get("tool") or action_data.get("action") or action_data.get("name")
                         
-                        # 提取参数
-                        raw_args = None
-                        for key in ["args", "params", "arguments", "parameters"]:
-                            if key in action_data:
-                                raw_args = action_data[key]
-                                break
-                        if isinstance(raw_args, str):
-                            try: tool_args = json.loads(raw_args)
-                            except:
-                                # 解析失败时，将原始字符串放入 'raw_input'，供工具识别
-                                tool_args = {"raw_input": raw_args}
-                        elif isinstance(raw_args, dict):
-                            tool_args = raw_args
-                        else:
-                            exclude_keys = ["tool", "action", "name", "args", "params", "arguments", "parameters", "thought", "thinking"]
-                            tool_args = {k: v for k, v in action_data.items() if k not in exclude_keys}
-
-                        if tool_name in tools:
-                            # 邮箱账号处理（保持不变）
-                            if tool_name in ["read_email", "send_email", "delete_email"]:
-                                if not CURRENT_EMAIL_PROFILE:
-                                    CURRENT_EMAIL_PROFILE = handle_email_selection()
-                                if CURRENT_EMAIL_PROFILE:
-                                    ep = CURRENT_EMAIL_PROFILE
-                                    tool_args["username"] = ep["username"]
-                                    tool_args["app_password"] = ep["password"]
-                                    if tool_name == "send_email":
-                                        tool_args["smtp_server"] = ep.get("smtp_server", "")  # 直接取存储值
-                                    else:
-                                        tool_args["imap_server"] = ep["server"]
-                                else:
-                                    observations.append(f"Result for {tool_name}: Action cancelled (no account).")
-                                    continue
+                        # ---> 核心修复：兼容 json_repair 将多个对象合并修复为列表的情况 <---
+                        actions = action_data if isinstance(action_data, list) else [action_data]
+                        
+                        for act in actions:
+                            if not (isinstance(act, dict) and any(k in act for k in ["tool", "action", "name"])):
+                                continue
+                            executed_any = True
+                            tool_name = act.get("tool") or act.get("action") or act.get("name")
                             
-                            # 权限确认
-                            choice = ask_user_permission(tool_name, tool_args)
-                            if choice == "Yes":
-                                # 安装/卸载/下载命令 → 自动路由到 launch_terminal
-                                if tool_name == "execute_bash":
-                                    cmd = tool_args.get("command", "")
-                                    install_kw = ["pip install", "pip3 install", "pip uninstall", "pip3 uninstall",
-                                                  "apt install", "apt-get install", "apt remove", "apt-get remove",
-                                                  "apt purge", "apt-get purge", "wget ", "curl -o", "curl -O",
-                                                  "git clone", "npm install -g", "npm uninstall -g", "brew install", "brew uninstall"]
-                                    if any(kw in cmd.lower() for kw in install_kw):
-                                        obs = tools["launch_terminal"](command=cmd)
+                            # 提取参数
+                            raw_args = None
+                            for key in ["args", "params", "arguments", "parameters"]:
+                                if key in act:
+                                    raw_args = act[key]
+                                    break
+                            
+                            if isinstance(raw_args, str):
+                                try:
+                                    tool_args = json.loads(raw_args)
+                                    if not isinstance(tool_args, dict):
+                                        tool_args = {"raw_input": raw_args}
+                                except:
+                                    tool_args = {"raw_input": raw_args}
+                            elif isinstance(raw_args, dict):
+                                tool_args = raw_args
+                            else:
+                                exclude_keys = ["tool", "action", "name", "args", "params", "arguments", "parameters", "thought", "thinking"]
+                                tool_args = {k: v for k, v in act.items() if k not in exclude_keys}
+
+                            if tool_name in tools:
+                                # -------- 核心防御：白名单严格过滤幻觉参数 --------
+                                if tool_name in manager.tools:
+                                    valid_keys = manager.tools[tool_name].parameters_schema.get("properties", {}).keys()
+                                    if valid_keys:
+                                        # 严格剥离所有不属于该工具定义的字段（杜绝意外 TypeError）
+                                        tool_args = {k: v for k, v in tool_args.items() if k in valid_keys}
+                                # ------------------------------------------------
+                                
+                                # 邮箱账号处理（保持不变）
+                                if tool_name in ["read_email", "send_email", "delete_email"]:
+                                    if not CURRENT_EMAIL_PROFILE:
+                                        CURRENT_EMAIL_PROFILE = handle_email_selection()
+                                    if CURRENT_EMAIL_PROFILE:
+                                        ep = CURRENT_EMAIL_PROFILE
+                                        tool_args["username"] = ep["username"]
+                                        tool_args["app_password"] = ep["password"]
+                                        if tool_name == "send_email":
+                                            tool_args["smtp_server"] = ep.get("smtp_server", "")  # 直接取存储值
+                                        else:
+                                            tool_args["imap_server"] = ep["server"]
+                                    else:
+                                        observations.append(f"Result for {tool_name}: Action cancelled (no account).")
+                                        continue
+                                
+                                # 权限确认
+                                choice = ask_user_permission(tool_name, tool_args)
+                                if choice == "Yes":
+                                    # 安装/卸载/下载命令 → 自动路由到 launch_terminal
+                                    if tool_name == "execute_bash":
+                                        cmd = tool_args.get("command", "")
+                                        install_kw = ["pip install", "pip3 install", "pip uninstall", "pip3 uninstall",
+                                                      "apt install", "apt-get install", "apt remove", "apt-get remove",
+                                                      "apt purge", "apt-get purge", "wget ", "curl -o", "curl -O",
+                                                      "git clone", "npm install -g", "npm uninstall -g", "brew install", "brew uninstall"]
+                                        if any(kw in cmd.lower() for kw in install_kw):
+                                            obs = tools["launch_terminal"](command=cmd)
+                                        else:
+                                            obs = tools[tool_name](**tool_args)
                                     else:
                                         obs = tools[tool_name](**tool_args)
+                                    observations.append(f"Observation from {tool_name}:\n{obs}")
+                                elif choice == "Switch Account":
+                                    CURRENT_EMAIL_PROFILE = None
+                                    console.print("[yellow]正在打开邮箱管理...[/yellow]")
+                                    CURRENT_EMAIL_PROFILE = handle_email_selection()
+                                    if CURRENT_EMAIL_PROFILE:
+                                        observations.append(f"Switched to account: {CURRENT_EMAIL_PROFILE['name']}. Please re-issue your email request.")
+                                    else:
+                                        observations.append(f"Account switch cancelled.")
+                                    # 注意：此工具不会执行，需要用户重新请求
                                 else:
-                                    obs = tools[tool_name](**tool_args)
-                                observations.append(f"Observation from {tool_name}:\n{obs}")
-                            elif choice == "Switch Account":
-                                CURRENT_EMAIL_PROFILE = None
-                                console.print("[yellow]正在打开邮箱管理...[/yellow]")
-                                CURRENT_EMAIL_PROFILE = handle_email_selection()
-                                if CURRENT_EMAIL_PROFILE:
-                                    observations.append(f"Switched to account: {CURRENT_EMAIL_PROFILE['name']}. Please re-issue your email request.")
-                                else:
-                                    observations.append(f"Account switch cancelled.")
-                                # 注意：此工具不会执行，需要用户重新请求
+                                    observations.append(f"Result for {tool_name}: Action cancelled by user.")
                             else:
-                                observations.append(f"Result for {tool_name}: Action cancelled by user.")
-                        else:
-                            observations.append(f"Error: Tool '{tool_name}' not recognized.")
+                                observations.append(f"Error: Tool '{tool_name}' not recognized.")
                     except Exception as e:
                         observations.append(f"Error parsing JSON block: {str(e)}")
 
