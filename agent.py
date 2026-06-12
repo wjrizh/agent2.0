@@ -484,7 +484,7 @@ def _extract_json_blocks(content):
     
     # 如果提取到了代码块，直接返回。让后续的 json_repair 处理完整的字符串，它有足够的智慧处理不平衡！
     if blocks:
-        return blocks
+        return [b for b in blocks if b.strip()]
     
     # 2. 回退机制：全文无围栏时，继续用括号提取裸露的 JSON
     idx = 0
