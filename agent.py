@@ -8,6 +8,7 @@ import os
 import subprocess
 import re
 import json
+from json_repair import repair_json
 import sys
 import termios
 import tty
@@ -32,6 +33,7 @@ client = OpenAI(
 
 from agent_tools.manager import ToolManager
 from agent_tools.builtin_tools import WriteFileTool, ExecuteBashTool, ReadFileTool, ListDirTool, LaunchTerminalTool, DownloadFileTool, WebFetchTool, ReadEmailTool, SendEmailTool, DeleteEmailTool, UpdateFileTool, GitTool, GlobTool, GrepTool, TaskCreateTool, TaskUpdateTool, TaskListTool, TaskGetTool, WebSearchTool, AskUserQuestionTool, SubmitPlanTool, CronCreateTool, CronListTool, CronDeleteTool, _CRON_JOBS
+from agent_tools.kicad_tools import KiCadCombinedQueryTool, KiCadModifyTool
 
 # 1. 实例化管理器（当前赋予管理员权限3）
 manager = ToolManager(current_user_role=3)
@@ -61,125 +63,82 @@ manager.register(SubmitPlanTool()) # <--- 新增：注册计划提交工具
 manager.register(CronCreateTool())   # <--- 新增：创建定时任务
 manager.register(CronListTool())     # <--- 新增：查询定时任务
 manager.register(CronDeleteTool())   # <--- 新增：删除定时任务
+manager.register(KiCadCombinedQueryTool())   # <--- 新增：KiCad 军工级融合查询工具
+manager.register(KiCadModifyTool())   # <--- 新增：KiCad PCB 修改工具
 
 # 3. 完美兼容：生成与旧版完全一样的 tools 字典！
 tools = manager.get_agent_tools_dict()
 
-# 4. 自动生成提示词 (在 agent.py 中修改 SYSTEM_PROMPT)
+# 4. 动态提示词与角色系统重构
 current_month = datetime.datetime.now().strftime("%Y-%m")
 
-SYSTEM_PROMPT = rf"""Your name is 力工. You are a secure local developer agent.
+# 全局变量：当前角色
+CURRENT_ROLE = "sysdev"  # 默认角色
 
- The user will primarily request you to perform software engineering tasks. When given an unclear instruction, consider it in the context of software engineering and the current working directory.
- 
- Crucially, do not propose changes to code you haven't read. If a user asks about or wants you to modify a file, you MUST use the `read_file` tool to read and inspect it first. Fully understand the existing codebase before suggesting or making any modifications.
+def get_role_tools(role: str) -> str:
+    """根据角色智能过滤可用工具，极大减少无关工具的干扰"""
+    # 系统工程师不需要 PCB 工具
+    sysdev_excludes = ["kicad_combined_query_tool", "kicad_modify_tool"]
+    # PCB 工程师只给核心必备工具
+    pcb_includes = ["kicad_combined_query_tool", "kicad_modify_tool", "read_file", "list_dir", "submit_plan", "ask_user_question"]
+    
+    lines = []
+    idx = 1
+    for name, tool in manager.tools.items():
+        if role == "sysdev" and name in sysdev_excludes:
+            continue
+        if role == "pcbengr" and name not in pcb_includes:
+            continue
+        
+        lines.append(f"{idx}. {name}")
+        lines.append(f"   Description: {tool.description}")
+        lines.append(f"   Parameters:")
+        props = tool.parameters_schema.get("properties", {})
+        for p_name, p_info in props.items():
+            lines.append(f"   - {p_name} ({p_info.get('type', 'any')}): {p_info.get('description', '')}")
+        idx += 1
+    return "\n".join(lines)
 
- When reading files via the `read_file` tool, remember:
- - Assume provided paths are valid.
- - Results are returned using `cat -n` format, with line numbers starting at 1.
- - It can only read files, not directories. To list a directory, use `list_dir`.
- - If you read a file that exists but has empty contents, you will receive a system reminder warning.
+def generate_system_prompt(role: str) -> str:
+    """按模块化拼装瘦身后的 System Prompt"""
+    base_prompt = f"""Your name is 力工. You are a secure local developer agent.
 
- When modifying code, you must strictly adhere to the "Minimalist Modification Doctrine":
- - **Avoid Over-engineering**: Make ONLY the changes directly requested or clearly necessary.
- - **No Gratuitous Content**: Do not add docstrings, comments, or type annotations to code you didn't explicitly change.
- - **Ruthless Cleanup**: Avoid backwards-compatibility shims. Delete provably unused code completely.
- - **Edit & Write Tool Discipline**: 
-   * ALWAYS prefer the `update_file` tool for modifying existing files. Only use `write_file` to create NEW files or for complete rewrites. 
-   * NEVER create documentation files (*.md) or README files unless explicitly requested. Do not write emojis to files unless asked.
-   * **String Replacement Design**: We strictly use exact string replacement (`search_block`) rather than line-number positioning for edits. Line numbers drift across multi-turn conversations, while string matching provides built-in validation (uniqueness checks) and naturally aligns with how LLMs process code.
-   * When using `update_file`, ensure you preserve the exact indentation (tabs/spaces) as it appears AFTER the line number prefix from the read output.
-   * The edit will FAIL if `search_block` is not unique. Provide a larger string with more context to make it unique, or use `replace_all=true` to change every instance across the file.
+CRITICAL JSON RULE: When outputting JSON for tool calls, the content MUST be a strict single-line string. NEVER use physical line breaks inside string values. Escaped as \\n.
+You MUST use this exact JSON schema for tool calls: {{"tool": "<tool_name>", "arguments": {{<params>}}}}. Wrap it in a ```json code block.
 
- When managing long-term context and instructions, strictly follow the "Auto Memory Strategy":
- - **Persistent Memory**: You have a persistent memory file located at `MEMORY.md` in the current directory. This file is automatically loaded into your context.
- - **Direct Access**: Use `write_file` and `update_file` directly to manage it. Do NOT use `mkdir` or check if it exists before writing.
- - **Memory Update Rules**: 
-   * Keep structure intact: Never modify existing section headers.
-   * Write info-dense content: Keep `MEMORY.md` concise (under 200 lines). For detailed topics, split into separate topic files and link them.
-   * ALWAYS update the 'Current State' section to reflect reality.
-   * **Memory System Private Feedback**: When the user provides guidance or corrects your mistakes, this is crucial private feedback. Before saving it, check if it conflicts with existing team feedback memory. If it conflicts, explicitly note it as an override, or ask the user.
- - **What to Save**: Stable patterns verified across multiple interactions, key architectural decisions, important project paths, user workflow/communication preferences, and frequently reused problem-solving experience. Check for existing content before saving to avoid duplicates.
- - **What NOT to Save**: Session-level context, incomplete info, duplicated project instructions, or speculative/unverified conclusions. Update or delete obsolete/wrong memories.
- - **User Commands**: If the user explicitly asks you to remember something, save it immediately. If they ask you to forget, delete the relevant entry. If they correct a memory, update it instantly.
- - **CLAUDE.md Creation**: If asked to create project documentation (like `CLAUDE.md` or `LIGONG.md`), actively examine the project structure, dependencies, build tools, and coding patterns to generate highly specific, context-aware instructions for yourself or other agents.
+Rules:
+1. ALWAYS wrap your Action in a ```json block. Stop generating text after your JSON block.
+2. For GUI apps or download/install commands, use 'launch_terminal'. For background commands, use 'execute_bash'.
+3. Your sudo password is 'zh030327'. Include it when needed.
+4. When a task is complete, output your text starting with "Final Answer:".
+5. ONLY use tools when necessary. For casual chat, respond directly WITHOUT generating any JSON block.
+6. The current month is {current_month}.
+"""
+    
+    if role == "sysdev":
+        role_prompt = """
+Current Role: System Software Engineer (SysDev)
+- Focus on robust code modification using update_file/write_file. Practice "Minimalist Modification".
+- Maintain persistent memory in MEMORY.md (Keep it under 200 lines).
+- Use tasks (task_create) and plans (submit_plan) for complex engineering.
+- NEVER propose changes to code you haven't read (use read_file first).
+"""
+    elif role == "pcbengr":
+        role_prompt = """
+Current Role: Hardware PCB Engineer (PCBEngr)
+- You MUST strictly follow 'PCB_LAYOUT_SOP.md'. Use read_file to read it FIRST.
+- Use `kicad_combined_query_tool` to understand netlists, physical bounds, and real device values.
+- Use `submit_plan` to propose specific coordinates BEFORE executing modifications.
+- Handle dry-run collision warnings iteratively. If a collision occurs during your dry_run, you MUST recalculate and try again until 0 collisions.
+"""
+    else:
+        role_prompt = ""
 
- When tackling tasks and encountering issues, adhere to the "Execution & Unblocking Strategy":
- - **Ambitious Execution**: Empower users to complete ambitious, complex tasks.
- - **Plan Mode (Alignment Before Code)**: Use the `submit_plan` tool PROACTIVELY when about to start a non-trivial implementation task (e.g., new features, multiple valid approaches, architectural decisions, multi-file changes, or unclear requirements). Getting sign-off on your approach before writing code prevents wasted effort. Do NOT use `submit_plan` for single-line fixes, pure research tasks, or when the user gave very specific instructions.
- - **Interactive Decision Making**: Use the `ask_user_question` tool to gather user preferences, clarify ambiguous instructions, or offer implementation choices as you work.
- - **Anti-Brute-Force**: If your approach is blocked, do NOT mindlessly retry the exact same action. Stop, analyze the root cause, and pivot.
- - **Dedicated Tools Over Bash**: Do NOT use `execute_bash` to run commands when a relevant dedicated tool is provided (Reading -> `read_file`, Editing -> `update_file`, Writing -> `write_file`, Searching Files -> `glob_tool`/`list_dir`, Searching Content -> `grep_tool`).
- - **Batch/Parallel Tool Calling**: Output multiple JSON tool blocks in a single response. It is ALWAYS better to speculatively read multiple potentially useful files in parallel. If tools depend on previous outputs, call them sequentially.
- - **Web & Search Strategy**: 
-   * Do NOT use `fetch_webpage` for authenticated or private URLs. For GitHub URLs, ALWAYS prefer using the `gh` CLI via Bash.
-   * Use `web_search` for up-to-date info. The current month is {current_month}. You MUST use this year when searching for recent information.
-   * **CRITICAL REQUIREMENT**: After answering a question using web data, you MUST include a "Sources:" section at the end of your Final Answer with markdown hyperlinks.
+    tools_str = get_role_tools(role)
+    return base_prompt + role_prompt + "\nAvailable Tools:\n" + tools_str
 
- When planning and tracking work, strictly follow the "Task Management Strategy":
- - **Structured Tracking**: Use the `task_create`, `task_update`, `task_list`, and `task_get` tools to create and maintain a structured task list for your current coding session.
- - **When to Use**: Complex multi-step tasks (3+ distinct steps), Plan mode is active, user explicitly requests a todo list, or user provides multiple tasks at once.
- - **Immediate Completion**: Mark tasks as 'completed' using `task_update` AS SOON AS you finish them. Do NOT batch up multiple tasks before marking them as completed.
-
- When scheduling tasks, strictly follow the "Scheduling & Reminders (Cron)":
- - **In-Session Lifespan**: Use `cron_create`, `cron_list`, and `cron_delete` to enqueue prompts for future times. Jobs live ONLY in this session and auto-expire after 3 days. Nothing is written to disk.
- - **Format**: Uses standard 5-field cron in the user's local timezone.
- - **Load Distribution**: Avoid the `:00` and `:30` minute marks when the task allows it to distribute API load.
-
- When analyzing context or reviewing conversation history, strictly follow the "Context Analysis Strategy":
- - **Structured Thinking (CoT)**: You MUST wrap your internal reasoning and analysis process in `<analysis></analysis>` tags BEFORE taking any action or answering.
- - **Full Conversation Analysis**: During your analysis, you MUST explicitly evaluate: 
-   1. Have ALL explicit user requests in the conversation been handled? 
-   2. Are there pending tasks requested by the user that haven't started? 
-   3. What is the task you were most recently working on? 
-   4. Are there any missed items or gaps?
- - **Recent Message Analysis**: When analyzing recent messages in a compacted context, focus EXCLUSIVELY on the new messages that appear AFTER the preserved early context. Do NOT re-summarize or re-analyze the early context that has already been preserved.
-
- When asked to summarize context or hand off a task, strictly follow the "Context Compaction Strategy":
- - **Structured Output**: Wrap your entire continuation summary in `<summary></summary>` tags.
- - **Required Sections**: Your summary must be concise, actionable, and include:
-   1. **Task Overview**: Core request, success criteria, clarifications, and constraints.
-   2. **Current State**: Completed work, modified/analyzed file paths, and key artifacts produced.
-   3. **Important Discoveries**: Technical constraints, design decisions (and rationale), resolved errors, and failed approaches.
-   4. **Next Steps**: Specific actions needed, blockers/open questions, and priority order.
-   5. **Context to Preserve**: User preferences, domain-specific details, and promises made.
- - **Goal**: Err on the side of including information that prevents duplicate work or repeated mistakes to enable immediate resumption of the task in a new context window.
-
- When communicating with the user, strictly follow the "Communication & Output Efficiency" guidelines:
- - **Be Extra Concise**: Go straight to the point. Lead with the answer or action, not the reasoning.
- - **Focus on What Matters**: Restrict text output to decisions needing user input, high-level status updates, and errors.
- - **One-Sentence Rule**: If you can say it in one sentence, do not use three.
- - **No Emojis**: Do NOT use emojis in any communication unless explicitly requested.
- - **Seamless Tool Calls**: Do NOT use a colon (`:`) immediately before a tool call block. End your transition text with a period.
-
- You MUST use this exact JSON schema for tool calls: {{"tool": "<tool_name>", "arguments": {{<params>}}}}. Wrap it in a ```json code block. NEVER use the flat format like {{"<tool_name>": {{<params>}}}}.
-
- Available Tools:
- {manager.generate_system_prompt_addition()}
-
- Rules:
- 1. ALWAYS wrap your Action in a ```json block. Do NOT output standalone "Action:" lines.
- 2. Stop generating immediately after your JSON Action block(s). Do not output plain text after the tool calls.
- 3. For GUI apps, use the 'launch_terminal' tool instead of execute_bash.
- 4. When a task is complete, output your text starting with "Final Answer:".
- 5. IF the user asks to read/send emails, JUST use the tool directly.
- 6. Your name is '力工'.
- 7. Proactive Execution: After creating a runnable script, immediately provide an 'Action' using 'execute_bash' to run it.
- 8. When reading emails, provide a structured summary in your "Final Answer": [ID], [Date], [From], [Summary].
- 9. If a command requires interactive user input, use 'launch_terminal'.
- 10. **Tool Necessity Rule**: ONLY use tools when the user's request explicitly requires file operations, system commands, emails, or git. Use `ask_user_question` or `submit_plan` for decisions/alignment. For casual chat, respond directly with a "Final Answer:" WITHOUT generating any JSON block.
- 11. **Direct Execution Principle**: When the request can be fulfilled by a tool, immediately output the JSON Action block WITHOUT accompanying explanatory text.
- 12. **Terminal Usage Rule**:
-     - Use `launch_terminal` for ALL download/install/uninstall commands (e.g., pip install, apt install, wget, git clone). These MUST run in a visible terminal so the user can see progress.
-     - Use `execute_bash` for ALL other commands including system queries. Output is captured and returned to you automatically.
- 13. Your sudo password is: `zh030327`. Include `"sudo_password": "zh030327"` when needed. Do NOT ask for the password.
- 14. **Uninstall Auto‑Verification Rule**: Use `launch_terminal` for uninstall commands so user can see progress. After uninstalling, run a verification command (e.g., `which <binary>`).
- 15. **No Time Estimates**: Avoid giving time estimates or predictions for tasks.
- 16. **STRICT JSON ESCAPING**: 
-     - NEVER use literal newlines inside a JSON string value. Use '\n' instead. 
-     - All backslashes in regex or code must be double-escaped (e.g., '\d' becomes '\\d'). 
-     - Ensure the entire JSON block is valid and can be parsed by 'json.loads(strict=False)'.
- """
+# 初始化 System Prompt
+SYSTEM_PROMPT = generate_system_prompt(CURRENT_ROLE)
 
 # ---------------- 新增：自动记忆 (Auto Memory) 自动加载机制 ----------------
 def get_memory_context():
@@ -364,7 +323,12 @@ def ask_user_permission(tool_name: str, tool_args: dict) -> str:
         return any(lower_cmd.startswith(l) for l in launchers)
     
     # --- 1. 免审白名单（维持现有安全工具自动通过）---
-    safe_tools = ["write_file", "read_file", "list_dir", "task_create", "task_update", "task_list", "task_get", "glob_tool", "grep_tool", "submit_plan", "launch_terminal", "delete_email", "read_email"]
+    safe_tools = [
+    "write_file", "read_file", "list_dir", "task_create", "task_update",
+    "task_list", "task_get", "glob_tool", "grep_tool", "submit_plan",
+    "launch_terminal", "delete_email", "read_email",
+    "kicad_combined_query_tool", "kicad_modify_tool"
+    ]
     if tool_name in safe_tools:
         return "Yes"
     
@@ -452,13 +416,11 @@ def ask_user_permission(tool_name: str, tool_args: dict) -> str:
     return options[selected_idx]
 
 def _sanitize_json(raw: str) -> str:
-    """清理常见 JSON 损坏字符：无中断空格、控制字符等"""
+    """清理常见 JSON 损坏字符：无中断空格、零宽空格、BOM等"""
     raw = raw.replace('\xa0', ' ')         # 无中断空格 -> 普通空格
     raw = raw.replace('\u200b', '')        # 零宽空格移除
     raw = raw.replace('\ufeff', '')        # BOM 移除
-    # 移除控制字符（除了制表符、换行符、回车符）
-    cleaned = ''.join(ch for ch in raw if ord(ch) >= 32 or ch in '\n\r\t')
-    return cleaned
+    return raw
 
 def _extract_json_blocks(content):
     """括号平衡提取所有 JSON 对象（修复单围栏内多工具块截断 Bug）"""
@@ -495,45 +457,53 @@ def _extract_json_blocks(content):
         idx += 1
     return blocks
 
-def _parse_balanced_json(text, start):
-	"""支持单双引号混合和转义的完美平衡树算法"""
-	if start >= len(text) or text[start] != '{':
-		return None
-		
-	in_string = False
-	string_char = None  # 记录当前是单引号还是双引号
-	escape = False
-	depth = 0
-	i = start
-	
-	while i < len(text):
-		c = text[i]
-		if escape:
-			escape = False
-			i += 1
-			continue
-			
-		if in_string:
-			if c == '\\':
-				escape = True
-			elif c == string_char:
-				in_string = False
-				string_char = None
-		else:
-			if c == '"' or c == "'":
-				in_string = True
-				string_char = c
-			elif c == '{':
-				depth += 1
-			elif c == '}':
-				depth -= 1
-				if depth == 0:
-					return text[start:i + 1]
-		i += 1
-	return None
+def _parse_balanced_json(text, start): 
+     """支持单双引号混合和转义的完美平衡树算法（带截断容错）""" 
+     if start >= len(text) or text[start] != '{': 
+         return None 
+         
+     in_string = False 
+     string_char = None  # 记录当前是单引号还是双引号 
+     escape = False 
+     depth = 0 
+     i = start 
+     
+     while i < len(text): 
+         c = text[i] 
+         if escape: 
+             escape = False 
+             i += 1 
+             continue 
+             
+         if in_string: 
+             if c == '\\': 
+                 escape = True 
+             elif c == string_char: 
+                 in_string = False 
+                 string_char = None 
+         else: 
+             if c == '"' or c == "'": 
+                 in_string = True 
+                 string_char = c 
+             elif c == '{': 
+                 depth += 1 
+             elif c == '}': 
+                 depth -= 1 
+                 if depth == 0: 
+                     return text[start:i + 1] 
+         i += 1 
+         
+     # ====== 核心修复区 ====== 
+     # 如果遍历到文本末尾，发现括号依然没有闭合（深度 > 0） 
+     # 说明大模型的输出被截断了（比如漏了最后的 '}'）。 
+     # 直接返回已经提取到的部分，交给后续的 repair_json 擦屁股补全！ 
+     if depth > 0: 
+         return text[start:i] 
+         
+     return None
 
 def run_agent(user_prompt):
-    global chat_history, CURRENT_EMAIL_PROFILE
+    global chat_history, CURRENT_EMAIL_PROFILE, SYSTEM_PROMPT
     
     # === 新增：动态任务提醒拦截 ===
     tasks_file = os.path.join(os.getcwd(), ".agent_tasks.json")
@@ -659,7 +629,9 @@ def run_agent(user_prompt):
             final_answer_json = None
             for raw_json in blocks:
                 try:
-                    data = json.loads(raw_json.replace('\xa0', ' '))
+                    raw_json = raw_json.replace('\xa0', ' ')
+                    repaired_json_str = repair_json(raw_json)
+                    data = json.loads(repaired_json_str)
                     if data.get("action") == "final_answer" or data.get("tool") == "final_answer":
                         final_answer_json = data.get("content") or data.get("answer") or data.get("text", "")
                         break
@@ -697,7 +669,9 @@ def run_agent(user_prompt):
                 for raw_json in blocks:
                     try:
                         raw_json = raw_json.replace('\xa0', ' ')
-                        action_data = json.loads(raw_json, strict=False)
+                        # 核心修复：先用 repair_json 擦除物理换行符等非法字符
+                        repaired_json_str = repair_json(raw_json)
+                        action_data = json.loads(repaired_json_str, strict=False)
                         if not (isinstance(action_data, dict) and any(k in action_data for k in ["tool", "action", "name"])):
                             continue
                         executed_any = True
@@ -932,6 +906,61 @@ threading.Thread(target=cron_daemon, daemon=True).start()
 
 # ================== 以下是全新的启动与守护逻辑 ==================
 
+def choose_role_interactive(is_startup=False):
+    """终端垂直菜单：选择角色"""
+    options = ["1. 系统工程师 (SysDev) - 默认全能", "2. 硬件PCB工程师 (PCBEngr) - 专精布局"]
+    if not is_startup:
+        options.append("3. 取消 (保持当前角色)")
+        
+    selected_idx = 0
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        while True:
+            os.system('clear')
+            
+            if is_startup:
+                sys.stdout.write("\r\n \033[1;36m力工 Agent 启动 - 请选择初始角色\033[0m\r\n\r\n")
+            else:
+                sys.stdout.write("\r\n \033[1;36m切换力工的职业形态：\033[0m\r\n\r\n")
+            
+            for i, opt in enumerate(options):
+                if i == selected_idx:
+                    sys.stdout.write(f"   \033[92m❯ {opt}\033[0m\r\n")
+                else:
+                    sys.stdout.write(f"     {opt}\r\n")
+                    
+            sys.stdout.write("\r\n \033[2m(上下键选择 · Enter 确认)\033[0m\r\n")
+            sys.stdout.flush()
+            
+            char = sys.stdin.read(1)
+            if char == '\x1b':
+                seq = sys.stdin.read(2)
+                if seq == '[A': selected_idx = (selected_idx - 1) % len(options)
+                elif seq == '[B': selected_idx = (selected_idx + 1) % len(options)
+            elif char in ['1', '2', '3']:
+                idx = int(char) - 1
+                if idx < len(options):
+                    selected_idx = idx
+                    break
+            elif char == '\r':
+                break
+            elif char == '\x03':
+                sys.stdout.write("\n\r")
+                if is_startup:
+                    cleanup_everything()
+                    sys.exit(0)
+                else:
+                    return None
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        sys.stdout.write("\n")
+        
+    if not is_startup and selected_idx == len(options) - 1:
+        return None
+    return "sysdev" if selected_idx == 0 else "pcbengr"
+
 def main():
     
     # 处理 --login 参数
@@ -952,7 +981,7 @@ def main():
             print(f"✅ 登录状态已保存到 {state_file}")
         sys.exit(0)
 
-    global chat_history, CURRENT_EMAIL_PROFILE, BRIDGE_PROC
+    global chat_history, CURRENT_EMAIL_PROFILE, BRIDGE_PROC, CURRENT_ROLE, SYSTEM_PROMPT
     # ================= 以下内容和原 if __name__ == "__main__" 完全一致 ================= 
     # 0. 拉起后台 (静默启动，不在第一屏抢戏) 
     if not start_and_watch_bridge(): 
@@ -1010,7 +1039,16 @@ def main():
     if selected_idx == 1: 
         sys.exit(0)   # 清理工作交给 finally 统一处理 
 
-    chat_history.append({"role": "system", "content": f"User trusted the folder. Your current absolute working directory is: {cwd}"}) 
+    # ================= 新增：启动时选择初始角色 ================= 
+    initial_role = choose_role_interactive(is_startup=True) 
+    CURRENT_ROLE = initial_role 
+    SYSTEM_PROMPT = generate_system_prompt(CURRENT_ROLE) 
+     
+    # 初始化历史记录 
+    with chat_history_lock: 
+        chat_history.clear() 
+        chat_history.append({"role": "system", "content": SYSTEM_PROMPT + get_memory_context()}) 
+        chat_history.append({"role": "system", "content": f"User trusted the folder. Your current absolute working directory is: {cwd}"}) 
 
     # ================= 第二幕：工作台与巨大LOGO ================= 
     os.system('clear') 
@@ -1166,6 +1204,34 @@ def main():
                         console.print(f"[red]切换请求失败，HTTP {resp.status_code}[/red]")
                 except Exception as e:
                     console.print(f"[red]无法连接到 Bridge 服务: {e}[/red]")
+                continue
+
+            # 角色切换命令 (升级垂直菜单版)
+            role_commands = ["/role", "切换角色", "角色切换"]
+            if any(task.strip().lower().startswith(cmd) for cmd in role_commands):
+                new_role = choose_role_interactive(is_startup=False)
+                
+                # 选完后清屏并重新打印 Logo，保持工作台整洁美观
+                os.system('clear')
+                console.print(Align.center(welcome_panel))
+                
+                if new_role is None:
+                    console.print("\n[yellow]角色切换已取消。[/yellow]")
+                    continue
+
+                if new_role != CURRENT_ROLE:
+                    CURRENT_ROLE = new_role
+                    SYSTEM_PROMPT = generate_system_prompt(CURRENT_ROLE)
+                    
+                    with chat_history_lock:
+                        chat_history.clear()
+                        chat_history.append({"role": "system", "content": SYSTEM_PROMPT + get_memory_context()})
+                        chat_history.append({"role": "system", "content": f"Working directory is: {cwd}"})
+                    
+                    console.print(f"\n[bold green]✅ 已成功切换至 {'系统工程师 (SysDev)' if new_role == 'sysdev' else '硬件PCB工程师 (PCBEngr)'}！[/bold green]")
+                    console.print("[dim]历史聊天上下文已清空释放，力工以满血状态就绪。[/dim]")
+                else:
+                    console.print("\n[yellow]当前已经是该角色。[/yellow]")
                 continue
 
             if task.startswith("/file "):
