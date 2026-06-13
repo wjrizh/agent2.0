@@ -1,0 +1,4 @@
+Import messages are saved in '/home/z/agent2.0/agent_tools/imports/ProPrj20260516/log.txt'
+Error: The importer expects the project directory to contain at most one .kicad_pcb file.
+However, it found 2 .kicad_pcb files: /home/z/下载/ProPrj_继电器_2026-05-16/.history/ProPrj_继电器_2026-05-16.kicad_pcb, /home/z/下载/ProPrj_继电器_2026-05-16/ProPrj_继电器_2026-05-16.kicad_pcb.
+Please delete all but one of them and re-run the importer.

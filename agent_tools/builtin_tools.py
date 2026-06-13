@@ -5,6 +5,10 @@ import time
 import pexpect
 import smtplib
 import json
+import re
+import urllib.request
+import urllib.error
+from rich.progress import Progress, TextColumn, BarColumn, DownloadColumn, TransferSpeedColumn, TimeRemainingColumn
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.application import MIMEApplication
@@ -55,106 +59,172 @@ class WriteFileTool(BaseTool):
             f.write(content)
         return f"File '{path}' written successfully to sandbox."
 
+# ----------------- 全局 PTY 执行引擎 (专治进度条吞字和交互式卡死) -----------------
+def run_pty_command(command: str, header_msg: str, timeout: int = 300, sudo_password: str = None, repo_path: str = None) -> str:
+    """全局 PTY (伪终端) 执行引擎，专治进度条吞字和交互式卡死"""
+    # 修复：只有当存在 header_msg 时，才打印额外的换行和头部提示
+    if header_msg:
+        sys.stdout.write(f"\n\033[1;36m{header_msg}\033[0m\n")
+        sys.stdout.flush()
+
+    try:
+        # 伪造环境变量，开启全局防卡死与进度条渲染支持
+        env_cmd = "export TERM=xterm; export DEBIAN_FRONTEND=noninteractive; export GIT_TERMINAL_PROMPT=1; "
+        
+        # 支持目录切换 (GitTool 需要)
+        if repo_path:
+            safe_repo = _secure_path(repo_path)
+            if not os.path.exists(safe_repo):
+                return f"Error: The directory '{repo_path}' does not exist."
+            env_cmd += f"cd {safe_repo} && "
+        
+        env_cmd += command
+
+        # Sudo 拦截与自动注入 (BashTool 需要)
+        if sudo_password and "sudo " in command:
+            child = pexpect.spawn('/bin/bash', ['-c', env_cmd.replace('sudo ', 'sudo -S ')], encoding='utf-8', timeout=timeout)
+            child.expect(['[sudo] password', '[P|p]assword'])
+            child.sendline(sudo_password)
+        else:
+            child = pexpect.spawn('/bin/bash', ['-c', env_cmd], encoding='utf-8', timeout=timeout)
+
+        output_buffer = []
+        try:
+            while True:
+                # 非阻塞流式读取，完美复刻原终端的 \r 刷新动画
+                chunk = child.read_nonblocking(size=1024, timeout=timeout)
+                display_chunk = chunk.replace('\r\n', '\n')
+                sys.stdout.write(display_chunk)
+                sys.stdout.flush()
+                output_buffer.append(chunk)
+                
+                # --- 智能感知：交互式提示符自动应答 ---
+                # 1. 拼接最近的 5 个 chunk，防止提示符刚好被截断
+                tail = "".join(output_buffer[-5:])
+                # 2. 剔除 ANSI 颜色控制符，防止正则匹配被颜色乱码干扰
+                clean_tail = re.sub(r'\x1b\[[0-9;]*m', '', tail)
+                
+                # ------------------------------------------
+                # --- 智能感知 1：固定交互自动应答 ---
+                AUTO_REPLIES = [
+                    (r'Proceed \([Yy]/[Nn]\)\?\s*$', 'Y'),
+                    (r'Do you want to continue\? \[[Yy]/[Nn]\]\s*$', 'Y'),
+                    (r'Is this OK\? \(yes\)\s*$', 'yes'),
+                    (r'continue connecting \(yes/no/\[fingerprint\]\)\?\s*$', 'yes'),
+                    (r'continue connecting \(yes/no\)\?\s*$', 'yes')
+                ]
+                
+                replied = False
+                for pattern, reply in AUTO_REPLIES:
+                    if re.search(pattern, clean_tail):
+                        child.sendline(reply)
+                        replied = True
+                        break
+                if replied: continue
+                
+                # --- 智能感知 2：动态拦截账号/密码输入 ---
+                # 匹配诸如: "Password:", "Enter passphrase:", "Username for 'https://github.com':"
+                if re.search(r'([Uu]sername|[Pp]assword|[Pp]assphrase).*:\s*$', clean_tail):
+                    is_pwd = bool(re.search(r'[Pp]assword|[Pp]assphrase', clean_tail))
+                    sys.stdout.write("\n")
+                    
+                    if is_pwd:
+                        import getpass
+                        # getpass 会隐藏用户在终端敲击的字符，保护隐私
+                        user_input = getpass.getpass("\033[1;33m[进程请求密码 (你的输入不可见)] \033[0m")
+                        # 往大模型日志里塞入一个占位符，既破坏了正则死循环，又防明文泄露
+                        output_buffer.append("\n[Human Password Entered Securely]\n")
+                    else:
+                        # 普通的 Username 等明文输入，直接用 input()
+                        user_input = input("\033[1;33m[进程请求账号] \033[0m")
+                        output_buffer.append(f"\n[Human Username Entered: {user_input}]\n")
+                        
+                    child.sendline(user_input)
+                    continue
+                # ------------------------------------------
+                
+        except pexpect.EOF:
+            pass # 执行正常结束
+        except pexpect.TIMEOUT:
+            sys.stdout.write(f"\n\033[1;31m[执行超时 ({timeout}s)]\033[0m\n")
+            output_buffer.append(f"\n[Execution Timed Out after {timeout}s]")
+        
+        child.close()
+        exit_status = child.exitstatus if child.exitstatus is not None else -1
+        
+        # --- 给 AI 擦屁股：清理日志，提取核心摘要 ---
+        full_output = "".join(output_buffer)
+        clean_output = re.sub(r'\x1b\[[0-9;]*m', '', full_output)  # 剔除颜色
+        clean_output = clean_output.replace('\r\n', '\n')          # 【核心修复】统一换行符
+        
+        lines = []
+        for line in clean_output.split('\n'):
+            if '\r' in line:
+                line = line.split('\r')[-1] # 折叠各种下载和编译的 \r 进度条
+            if line.strip():                # 剔除空行
+                lines.append(line.strip())
+        
+        final_clean = "\n".join(lines)
+        # 合并连续换行（修复 \r\n 边界截断导致的多余空行）
+        final_clean = re.sub(r'\n{3,}', '\n\n', final_clean)
+        
+        # 🚀 高级日志截断：掐头去尾防撑爆大模型
+        MAX_LOG_LEN = 4000
+        if len(final_clean) > MAX_LOG_LEN:
+            head_len = 1000  # 保留开头的 1000 字符（环境识别）
+            tail_len = 3000  # 保留结尾的 3000 字符（核心报错区）
+            omitted = len(final_clean) - MAX_LOG_LEN
+            
+            final_clean = (
+                final_clean[:head_len] +
+                f"\n\n... ( ✂️ Log too long. Omitted {omitted} characters in the middle ) ...\n\n" +
+                final_clean[-tail_len:]
+            )
+
+        return f"Exit Code: {exit_status}\nTerminal Output:\n{final_clean}"
+
+    except Exception as e:
+        return f"Execution Error: {str(e)}"
+
 # ----------------- 终极解锁版：执行脚本 (支持 sudo 注入) -----------------
 class ExecuteBashTool(BaseTool):
     name = "execute_bash"
-    description = "Run any shell command. Destructive root commands are blocked. Supports automatic sudo password injection."
+    description = "Run shell commands. Uses a pseudo-terminal (PTY) to stream output and capture results (including exit codes) for AI. Perfect for apt/pip installs."
     required_role = 3
-    timeout = 120    
+    timeout = 300  # 安装包可能耗时较长，放宽到 5 分钟
     parameters_schema = {
         "required": ["command"],
         "properties": {
             "command": {"type": "string", "description": "The shell command to run."},
-            "sudo_password": {"type": "string", "description": "Optional. The user password if sudo is required."}
+            "sudo_password": {"type": "string", "description": "Optional sudo password."}
         }
     }
 
     def run(self, command: str, sudo_password: str = None) -> str:
         forbidden_patterns = ["rm -rf /", "rm -rf *", "rm -fr /", "rm -fr *", "rm -rf .", "rm -rf /*"]
         normalized_cmd = command.lower().replace("  ", " ")
-        
         if any(p in normalized_cmd for p in forbidden_patterns):
              raise SecurityError("Safety Block: Destructive command 'rm -rf' on root/wildcard detected.")
 
-        # 拦截必须在新终端执行的命令
-        def _must_use_terminal(cmd: str) -> bool:
+        # 只拦截纯 GUI 程序
+        def _is_gui_app(cmd: str) -> bool:
             lower_cmd = cmd.strip().lower()
             launchers = [
                 "xdg-open", "x-www-browser", "gnome-open", "kde-open",
-                "sensible-browser", "gio open", "open ", "start ",
-                "firefox", "google-chrome", "chromium-browser", "chromium",
-                "brave-browser", "vivaldi", "opera", "vlc", "code", "gnome-terminal",
-                "xfce4-terminal", "konsole", "terminator", "kazam", "obs", "audacity"
+                "firefox", "google-chrome", "vlc", "code", "obs"
             ]
-            if any(lower_cmd.startswith(l) for l in launchers):
-                return True
-            interactive_patterns = [
-                "gh auth", "npm init", "npm login", "ssh ", "ssh-keygen",
-                "adduser", "passwd", "nano ", "vim ", "vi ", "emacs "
-            ]
-            if any(p in lower_cmd for p in interactive_patterns):
-                return True
-            if any(kw in lower_cmd for kw in ["serve", "daemon", "--watch"]):
-                return True
-            # 安装/卸载/大文件下载 → 必须弹出终端
-            install_uninstall_kw = [
-                "pip install", "pip3 install", "pip uninstall", "pip3 uninstall",
-                "apt install", "apt-get install", "apt remove", "apt-get remove",
-                "apt purge", "apt-get purge", "yum install", "yum remove",
-                "dnf install", "dnf remove", "brew install", "brew uninstall",
-                "npm install -g", "npm i -g", "npm uninstall -g", "npm remove -g",
-                "cargo install", "cargo uninstall", "gem install", "gem uninstall",
-                "snap install", "snap remove", "wget ", "curl -o", "curl -O",
-                "git clone"
-            ]
-            if any(kw in lower_cmd for kw in install_uninstall_kw):
-                return True
-            return False
+            return any(lower_cmd.startswith(l) for l in launchers)
 
-        if _must_use_terminal(command):
-            return (
-                "Error: This command is a long‑running GUI app, an installation, or an interactive process. "
-                "It MUST be executed using the 'launch_terminal' tool instead of 'execute_bash'. "
-                "Please retry with the launch_terminal tool (include sudo_password if needed)."
-            )
+        if _is_gui_app(command):
+            return "Error: This is a GUI app. Please use 'launch_terminal' instead."
 
-        try:
-            wrapped_command = command
-            # 强制非交互模式，防止 debconf/dpkg 等弹出交互提示导致永久阻塞
-            wrapped_command = f"export DEBIAN_FRONTEND=noninteractive; {command}"
-            
-            if sudo_password and "sudo " in command:
-                # 将 sudo 替换为 sudo -S 以便通过 stdin 注入密码
-                wrapped_command = f"export DEBIAN_FRONTEND=noninteractive; {command.replace('sudo ', 'sudo -S ')}"
-                result = subprocess.run(
-                    wrapped_command,
-                    shell=True,
-                    capture_output=True,
-                    text=True,
-                    timeout=self.timeout,
-                    input=sudo_password + "\n"
-                )
-            else:
-                result = subprocess.run(
-                    wrapped_command,
-                    shell=True,
-                    capture_output=True,
-                    text=True,
-                    timeout=self.timeout
-                )
-            out = result.stdout.strip()
-            err = result.stderr.strip()
-            if not out and not err:
-                return "Command executed successfully (no output)."
-            output = []
-            if out: output.append(f"STDOUT:\n{out}")
-            if err: output.append(f"STDERR:\n{err}")
-            return "\n".join(output)
-
-        except subprocess.TimeoutExpired:
-             return f"Error: Command timed out after {self.timeout} seconds."
-        except Exception as e:
-            return f"Execution Error: {str(e)}"
+        # 核心：直接调用全局 PTY 引擎
+        return run_pty_command(
+            command=command,
+            header_msg="",
+            timeout=self.timeout,
+            sudo_password=sudo_password
+        )
 
 # ----------------- 升级版：读取文件 -----------------
 class ReadFileTool(BaseTool):
@@ -371,26 +441,51 @@ from email.header import decode_header
 # ----------------- 新增：网络文件下载工具 -----------------
 class DownloadFileTool(BaseTool):
     name = "download_file"
-    description = "Download a file from a URL and save it to the local sandbox workspace."
+    description = "Download a file natively with an interactive progress bar. Returns structured JSON status to AI."
     required_role = 2
     parameters_schema = {
         "required": ["url", "filename"],
         "properties": {
             "url": {"type": "string", "description": "The URL of the file to download."},
-            "filename": {"type": "string", "description": "The local filename to save it as (e.g., 'app.zip')."}
+            "filename": {"type": "string", "description": "The local filename to save it as."}
         }
     }
 
     def run(self, url: str, filename: str) -> str:
-        safe_path = _secure_path(filename) # 复用安全路径校验
+        safe_path = _secure_path(filename)
         try:
-            # 添加伪装 Header，防止被简单的反爬虫拦截
             req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req) as response, open(safe_path, 'wb') as out_file:
-                out_file.write(response.read())
-            return f"Successfully downloaded file from {url} and saved to {filename}"
+            with urllib.request.urlopen(req) as response:
+                total_size = int(response.info().get("Content-Length", 0))
+                
+                with open(safe_path, 'wb') as out_file:
+                    if total_size == 0:
+                        # 无法获取大小时，直接下载
+                        out_file.write(response.read())
+                    else:
+                        # 引擎核心：Rich 炫酷进度条
+                        progress = Progress(
+                            TextColumn("[bold cyan]{task.fields[filename]}", justify="right"),
+                            BarColumn(bar_width=None, complete_style="green"),
+                            "[progress.percentage]{task.percentage:>3.1f}%",
+                            "•", DownloadColumn(),
+                            "•", TransferSpeedColumn(),
+                            "•", TimeRemainingColumn(),
+                        )
+                        with progress:
+                            task_id = progress.add_task("Downloading", filename=os.path.basename(filename), total=total_size)
+                            while True:
+                                chunk = response.read(8192)
+                                if not chunk:
+                                    break
+                                out_file.write(chunk)
+                                progress.update(task_id, advance=len(chunk))
+            
+            size_mb = os.path.getsize(safe_path) / (1024 * 1024)
+            # 返回干净的结构化数据给 AI
+            return f'{{"status": "success", "file": "{filename}", "size_mb": {size_mb:.2f}, "message": "Native download completed."}}'
         except Exception as e:
-            return f"Failed to download file: {str(e)}"
+            return f'{{"status": "error", "message": "{str(e)}"}}'
 
 # ----------------- 升级版：网页内容读取工具 (WebFetch) -----------------
 class WebFetchTool(BaseTool):
@@ -704,82 +799,96 @@ class UpdateFileTool(BaseTool):
 # ----------------- 新增：Git 核心操作工具 -----------------
 class GitTool(BaseTool):
     name = "git_tool"
-    description = "Execute git commands (e.g., 'status', 'add .', 'commit -m \"msg\"', 'push', 'pull', 'log', 'branch'). Just provide the arguments after 'git'."
+    description = "Execute git commands (e.g., 'clone', 'status', 'add .', 'commit', 'push', 'pull'). Uses PTY to handle interactions natively."
     required_role = 2
+    timeout = 120
     parameters_schema = {
         "required": ["command"],
         "properties": {
-            "command": {"type": "string", "description": "The git subcommand and arguments (e.g., 'commit -m \"fix bug\"' or 'status')."}
+            "command": {"type": "string", "description": "The git subcommand and arguments (e.g., 'commit -m \"fix bug\"' or 'status')."},
+            "repo_path": {"type": "string", "description": "Optional. The directory to run the git command in."}
         }
     }
 
-    def run(self, command: str) -> str:
-        # 防挂起保护：拦截没有 -m 的 commit，防止弹出 vim/nano 导致主线程永久卡死
+    def run(self, command: str, repo_path: str = None) -> str:
+        # 防挂起保护：拦截没有 -m 的 commit
         if command.strip() in ["commit", "commit -a"]:
             return "Error: You must provide a commit message using -m, e.g., 'commit -m \"message\"'. Interactive text editors are not supported in this sandbox."
             
-        full_command = f"git {command}"
-        try:
-            result = subprocess.run(
-                full_command,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout
-            )
-            
-            out = result.stdout.strip()
-            err = result.stderr.strip()
-            
-            if result.returncode != 0:
-                return f"Git Command Failed (Code {result.returncode}):\n{err}\n{out}".strip()
-            
-            output = []
-            if out: output.append(f"STDOUT:\n{out}")
-            if err: output.append(f"STDERR:\n{err}")
-            return "\n".join(output) if output else "Git command executed successfully (no output)."
-        except Exception as e:
-            return f"Git Execution Error: {str(e)}"
+        cmd_str = command.strip()
+        if not cmd_str.startswith("git "):
+            cmd_str = f"git {cmd_str}"
+
+        # 核心：直接调用全局 PTY 引擎
+        return run_pty_command(
+            command=cmd_str,
+            header_msg="",
+            timeout=self.timeout,
+            repo_path=repo_path
+        )
 
 # ----------------- 新增：Glob 搜索工具 -----------------
 import glob
 
 class GlobTool(BaseTool):
     name = "glob_tool"
-    description = "Fast file pattern matching tool. Supports glob patterns like '**/*.js'. Returns matching file paths sorted by modification time. Use this to find files by name patterns."
-    required_role = 1
+    description = "Search for files using glob patterns (e.g., '**/*.py'). Supports recursive search and specific target directories."
     parameters_schema = {
-        "required": ["pattern"],
+        "type": "object",
         "properties": {
-            "pattern": {"type": "string", "description": "The glob pattern to search for (e.g., 'src/**/*.js')."}
-        }
+            "pattern": {
+                "type": "string",
+                "description": "The glob pattern to search for (e.g., '**/*.js'). Use ** for recursive search."
+            },
+            "path": {
+                "type": "string",
+                "description": "Optional. The base directory to search in. Defaults to current working directory."
+            }
+        },
+        "required": ["pattern"]
     }
 
-    def run(self, pattern: str) -> str:
+    def run(self, pattern: str, path: str = None, **kwargs) -> str:
+        import glob
+        import os
+
+        # 1. 解决缺陷 1 & 4: 增加 path 参数，摆脱强制绑定 os.getcwd()
+        base_path = os.path.abspath(path) if path else os.getcwd()
+
+        # 2. 解决缺陷 2: 智能优化反直觉行为
+        # 如果用户只输入了形如 "*.py" 的 pattern（没有路径分隔符，且以 *. 开头）
+        # 自动将其转换为 "**/*.py" 以支持向下递归
+        if not pattern.startswith("**/") and "/" not in pattern and pattern.startswith("*."):
+            pattern = f"**/{pattern}"
+
+        # 3. 拼接绝对搜索路径
+        search_path = os.path.join(base_path, pattern)
+
         try:
-            # 兼容绝对路径和相对路径处理
-            safe_pattern = _secure_path(pattern) if not pattern.startswith("*") and not os.path.isabs(pattern) else pattern
+            # 执行递归搜索
+            matches = glob.glob(search_path, recursive=True)
             
-            if pattern.startswith("*"):
-                 matches = glob.glob(os.path.join(os.getcwd(), pattern), recursive=True)
-            else:
-                 matches = glob.glob(safe_pattern, recursive=True)
-                 
             if not matches:
-                return f"No files found matching pattern: {pattern}"
+                return f"No files found matching pattern '{pattern}' in directory '{base_path}'"
+
+            # 将绝对路径转换为相对路径，减少 Token 消耗
+            rel_files = [os.path.relpath(f, base_path) for f in matches]
             
-            # 按修改时间倒序排列 (最近修改的文件排在最前面)
-            matches.sort(key=lambda x: os.path.getmtime(x) if os.path.exists(x) else 0, reverse=True)
+            total_found = len(rel_files)
+            limit = 200
             
-            # 转为相对路径，让大模型看着更清爽
-            cwd = os.getcwd()
-            rel_matches = [os.path.relpath(m, cwd) for m in matches]
+            # 限制返回数量
+            display_files = rel_files[:limit]
             
-            if len(rel_matches) > 200:
-                return "\n".join(rel_matches[:200]) + f"\n... and {len(rel_matches) - 200} more."
-            return "\n".join(rel_matches)
+            result = f"Found {total_found} file(s) matching '{pattern}' in '{base_path}':\n"
+            result += "\n".join(display_files)
+            
+            if total_found > limit:
+                result += f"\n\n... (Showing first {limit} results out of {total_found}. Please refine your pattern.)"
+                
+            return result
         except Exception as e:
-            return f"Glob error: {str(e)}"
+            return f"Error executing glob search: {str(e)}"
 
 # ----------------- 升级版：Grep 内容搜索工具 (支持文件过滤、多模式与多行) -----------------
 import re

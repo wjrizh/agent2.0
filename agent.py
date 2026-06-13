@@ -112,7 +112,8 @@ Rules:
 3. Your sudo password is 'zh030327'. Include it when needed.
 4. When a task is complete, output your text starting with "Final Answer:".
 5. ONLY use tools when necessary. For casual chat, respond directly WITHOUT generating any JSON block.
-6. The current month is {current_month}.
+6. ABSOLUTELY DO NOT use XML tags like <｜｜DSML｜｜...>. ONLY output standard Markdown ```json blocks.
+7. The current month is {current_month}.
 """
     
     if role == "sysdev":
@@ -336,7 +337,8 @@ def ask_user_permission(tool_name: str, tool_args: dict) -> str:
     "write_file", "read_file", "list_dir", "task_create", "task_update",
     "task_list", "task_get", "glob_tool", "grep_tool", "submit_plan",
     "launch_terminal", "delete_email", "read_email",
-    "kicad_combined_query_tool", "kicad_modify_tool"
+    "kicad_combined_query_tool", "kicad_modify_tool",
+    "web_search", "fetch_webpage", "git_tool"
     ]
     if tool_name in safe_tools:
         return "Yes"
@@ -475,27 +477,45 @@ def _extract_json_blocks(content):
     """修复版：整体提取代码围栏内容，绝对禁止在围栏内使用括号匹配提前截断"""
     blocks = []
     
-    # 1. 优先从 ```json ... ``` 围栏中提取全部内容（将整个块视为一个完整的待解析实体）
-    fence_pattern = re.compile(r'```(?:json)?\s*\n?(.*?)\n?```', re.DOTALL)
+    # 1. 严格限定只提取 ```json ... ``` 围栏内容
+    fence_pattern = re.compile(r'```json\s*\n?(.*?)\n?```', re.DOTALL)
     for match in fence_pattern.finditer(content):
         text = match.group(1).strip()
         if text:
             blocks.append(text)
     
-    # 如果提取到了代码块，直接返回。让后续的 json_repair 处理完整的字符串，它有足够的智慧处理不平衡！
+    # 如果提取到了标准 json 代码块，直接返回。让后续处理完整的字符串
     if blocks:
         return [b for b in blocks if b.strip()]
     
-    # 2. 回退机制：全文无围栏时，继续用括号提取裸露的 JSON
+    # --- 🛡️ 防火墙 1：预清洗 ---
+    # 剔除明确的非 json 代码块（如 ```python, ```text, ```cpp 等）
+    # 避免后续扫描到其他语言代码里包含的字典、结构体或花括号
+    clean_content = re.sub(r'```(?!json\b)[\w+-]+\s*\n.*?```', '', content, flags=re.DOTALL)
+    
+    # 👇👇👇 [新增：防火墙 1.5 - 输出流分段与截断] 👇👇👇
+    # 如果文本中明确包含了 Final Answer:，说明后续为最终纯文本回答。
+    # 截断它，不让后续的裸括号扫描机制误判 URL 参数或说明文字中的花括号
+    if "Final Answer:" in clean_content:
+        clean_content = clean_content.split("Final Answer:")[0]
+    # 👆👆👆 ========================================== 👆👆👆
+    
+    # 2. 回退机制：全文无 json 围栏时，继续用括号提取裸露的 JSON
+    # (完美兼容无语言标记的裸围栏 ``` {...} ``` 或纯文本里的调用)
     idx = 0
-    while idx < len(content):
-        if content[idx] == '{':
-            block = _parse_balanced_json(content, idx)
+    while idx < len(clean_content):
+        if clean_content[idx] == '{':
+            block = _parse_balanced_json(clean_content, idx)
             if block:
-                blocks.append(block)
-                idx = content.index(block, idx) + len(block)
+                # --- 🛡️ 防火墙 2：特征校验 ---
+                # 终极防御：如果是在正文中裸抓的 {}，它必须看起来像个工具调用才行！
+                # 过滤掉偶然匹配到的 C语言块、Python字典、Bash扩展 {1..5} 等垃圾文本
+                if '"tool"' in block or '"action"' in block or '"name"' in block:
+                    blocks.append(block)
+                idx = clean_content.index(block, idx) + len(block)
                 continue
         idx += 1
+        
     return blocks
 
 def _parse_balanced_json(text, start): 
@@ -644,6 +664,23 @@ def run_agent(user_prompt):
             content = re.sub(r'<think>.*?</think>', '', raw_content, flags=re.DOTALL)
             content = re.sub(r'^已思考[\s\S]*?\n\n', '', content).strip()
             
+            # --- 2.5 核心修复：拦截并转换 DeepSeek 原生 DSML 工具调用标签 ---
+            if "DSML" in content:
+                # 匹配形如 <｜｜DSML｜｜invoke name="xxx"> {...} 的结构 (兼容全半角竖线)
+                dsml_pattern = r'<[|｜]{2}DSML[|｜]{2}invoke name="([^"]+)">\s*(.*?)\s*(?:</[|｜]{2}DSML[|｜]{2}invoke>|<[|｜]{2}DSML|$)'
+                
+                def dsml_repl(m):
+                    t_name = m.group(1)
+                    t_args = m.group(2).strip()
+                    if not t_args:
+                        t_args = "{}"
+                    # 组装为 Agent 认识的标准 Markdown JSON 格式
+                    return f'\n```json\n{{"tool": "{t_name}", "arguments": {t_args}}}\n```\n'
+                
+                content = re.sub(dsml_pattern, dsml_repl, content, flags=re.DOTALL)
+                # 抹除可能残留的头尾标签 (例如 <｜｜DSML｜｜tool_calls>)
+                content = re.sub(r'<[|｜]{2}DSML[^>]*>', '', content)
+            
             # --- 3. 自动续写：检测到“已停止”则发送明确的续写指令 ---
             if "已停止" in content:
                 console.print("[dim]检测到回复中断，自动请求续写...[/dim]")
@@ -785,19 +822,8 @@ def run_agent(user_prompt):
                                 # 权限确认
                                 choice = ask_user_permission(tool_name, tool_args)
                                 if choice == "Yes":
-                                    # 安装/卸载/下载命令 → 自动路由到 launch_terminal
-                                    if tool_name == "execute_bash":
-                                        cmd = tool_args.get("command", "")
-                                        install_kw = ["pip install", "pip3 install", "pip uninstall", "pip3 uninstall",
-                                                      "apt install", "apt-get install", "apt remove", "apt-get remove",
-                                                      "apt purge", "apt-get purge", "wget ", "curl -o", "curl -O",
-                                                      "git clone", "npm install -g", "npm uninstall -g", "brew install", "brew uninstall"]
-                                        if any(kw in cmd.lower() for kw in install_kw):
-                                            obs = tools["launch_terminal"](command=cmd)
-                                        else:
-                                            obs = tools[tool_name](**tool_args)
-                                    else:
-                                        obs = tools[tool_name](**tool_args)
+                                    # 执行工具，双引擎自动接管内部逻辑
+                                    obs = tools[tool_name](**tool_args)
                                     observations.append(f"Observation from {tool_name}:\n{obs}")
                                 elif choice == "Switch Account":
                                     CURRENT_EMAIL_PROFILE = None
@@ -824,6 +850,18 @@ def run_agent(user_prompt):
 
                 # 有 JSON 块但全部解析失败 → 反馈错误让 AI 自修复
                 if blocks and observations:
+                    
+                    # 👇👇👇 [新增：容错降级] 👇👇👇
+                    # 如果解析由于误判发生了报错，但我们在同一条内容里检测到了 "Final Answer:" 标记。
+                    # 直接判定为模型本意是结束对话，跳出错误检测，强行终止循环并回显。
+                    if "Final Answer:" in content:
+                        final_ans = content.split("Final Answer:")[1].strip()
+                        console.print(f"\n[bold green]力工 >[/bold green] {final_ans}\n")
+                        with chat_history_lock:
+                            chat_history.append({"role": "assistant", "content": content})
+                        break
+                    # 👆👆👆 ================= 👆👆👆
+
                     with chat_history_lock:
                         chat_history.append({"role": "assistant", "content": content})
                         feedback = "\n\n".join(observations)
