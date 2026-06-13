@@ -47,40 +47,56 @@ class WriteFileTool(BaseTool):
             # 返回警告而不是直接写入
             return f"Error: File '{path}' already exists. To prevent accidental data loss, you MUST use 'read_file' to understand it first. If you want to modify it, prefer using 'update_file'. If you are absolutely sure you want to completely overwrite it, you must use 'execute_bash' to delete it first, or explicitly request user permission."
 
-        # 原有清洗逻辑
+        # 智能剥离外围代码块围栏（仅首尾行是完整 ``` 才剥，不误伤代码内三引号）
         content = content.strip()
-        if content.startswith("```"):
-            lines = content.split('\n')
-            if len(lines) > 0 and lines[0].startswith("```"): lines = lines[1:]
-            if len(lines) > 0 and lines[-1].strip() == "```": lines = lines[:-1]
-            content = '\n'.join(lines)
+        lines = content.split('\n')
+        if lines and re.match(r'^```[\w]*\s*$', lines[0]):
+            if len(lines) >= 2 and lines[-1].strip() == '```':
+                lines = lines[1:-1]
+                content = '\n'.join(lines)
             
         with open(safe_path, 'w', encoding="utf-8") as f:
             f.write(content)
         return f"File '{path}' written successfully to sandbox."
 
-# ----------------- 全局 PTY 执行引擎 (专治进度条吞字和交互式卡死) -----------------
-def run_pty_command(command: str, header_msg: str, timeout: int = 300, sudo_password: str = None, repo_path: str = None) -> str:
-    """全局 PTY (伪终端) 执行引擎，专治进度条吞字和交互式卡死"""
-    # 修复：只有当存在 header_msg 时，才打印额外的换行和头部提示
+# ----------------- 全局 PTY 执行引擎 (专治进度条吞字、交互式卡死与僵尸进程) -----------------
+def run_pty_command(command: str, header_msg: str, timeout: int = 30000, sudo_password: str = None, repo_path: str = None) -> str:
+    """全局 PTY (伪终端) 执行引擎，专治进度条吞字、交互式卡死与僵尸进程"""
+    import os
+    import signal
+    import getpass
+
     if header_msg:
         sys.stdout.write(f"\n\033[1;36m{header_msg}\033[0m\n")
         sys.stdout.flush()
 
+    child = None
     try:
-        # 伪造环境变量，开启全局防卡死与进度条渲染支持
         env_cmd = "export TERM=xterm; export DEBIAN_FRONTEND=noninteractive; export GIT_TERMINAL_PROMPT=1; "
-        
-        # 支持目录切换 (GitTool 需要)
         if repo_path:
             safe_repo = _secure_path(repo_path)
             if not os.path.exists(safe_repo):
                 return f"Error: The directory '{repo_path}' does not exist."
             env_cmd += f"cd {safe_repo} && "
-        
         env_cmd += command
 
-        # Sudo 拦截与自动注入 (BashTool 需要)
+        # 自动剥离会缓冲/吞掉流式输出的管道（tail/head/wc/grep -c 等）
+        import re
+        blocked_patterns = [
+            r'\|\s*tail\s+-\d+',   # | tail -10
+            r'\|\s*head\s+-\d+',   # | head -5
+            r'\|\s*wc\s+-l',        # | wc -l
+            r'\|\s*grep\s+-c',       # | grep -c
+        ]
+        for pat in blocked_patterns:
+            if re.search(pat, env_cmd):
+                return (
+                    "Error: Your command contains a pipeline (e.g. | tail -10) "
+                    "that would buffer output and hide real-time progress. "
+                    "Remove the pipeline and let the tool's built-in truncation "
+                    "(last 4000 chars sent to AI) handle the summary for you."
+                )
+
         if sudo_password and "sudo " in command:
             child = pexpect.spawn('/bin/bash', ['-c', env_cmd.replace('sudo ', 'sudo -S ')], encoding='utf-8', timeout=timeout)
             child.expect(['[sudo] password', '[P|p]assword'])
@@ -91,21 +107,15 @@ def run_pty_command(command: str, header_msg: str, timeout: int = 300, sudo_pass
         output_buffer = []
         try:
             while True:
-                # 非阻塞流式读取，完美复刻原终端的 \r 刷新动画
                 chunk = child.read_nonblocking(size=1024, timeout=timeout)
                 display_chunk = chunk.replace('\r\n', '\n')
                 sys.stdout.write(display_chunk)
                 sys.stdout.flush()
                 output_buffer.append(chunk)
                 
-                # --- 智能感知：交互式提示符自动应答 ---
-                # 1. 拼接最近的 5 个 chunk，防止提示符刚好被截断
                 tail = "".join(output_buffer[-5:])
-                # 2. 剔除 ANSI 颜色控制符，防止正则匹配被颜色乱码干扰
                 clean_tail = re.sub(r'\x1b\[[0-9;]*m', '', tail)
                 
-                # ------------------------------------------
-                # --- 智能感知 1：固定交互自动应答 ---
                 AUTO_REPLIES = [
                     (r'Proceed \([Yy]/[Nn]\)\?\s*$', 'Y'),
                     (r'Do you want to continue\? \[[Yy]/[Nn]\]\s*$', 'Y'),
@@ -122,67 +132,79 @@ def run_pty_command(command: str, header_msg: str, timeout: int = 300, sudo_pass
                         break
                 if replied: continue
                 
-                # --- 智能感知 2：动态拦截账号/密码输入 ---
-                # 匹配诸如: "Password:", "Enter passphrase:", "Username for 'https://github.com':"
                 if re.search(r'([Uu]sername|[Pp]assword|[Pp]assphrase).*:\s*$', clean_tail):
                     is_pwd = bool(re.search(r'[Pp]assword|[Pp]assphrase', clean_tail))
                     sys.stdout.write("\n")
-                    
                     if is_pwd:
-                        import getpass
-                        # getpass 会隐藏用户在终端敲击的字符，保护隐私
-                        user_input = getpass.getpass("\033[1;33m[进程请求密码 (你的输入不可见)] \033[0m")
-                        # 往大模型日志里塞入一个占位符，既破坏了正则死循环，又防明文泄露
+                        user_input = getpass.getpass("\033[1;33m[🔒 进程请求密码 (你的输入不可见)] \033[0m")
                         output_buffer.append("\n[Human Password Entered Securely]\n")
                     else:
-                        # 普通的 Username 等明文输入，直接用 input()
-                        user_input = input("\033[1;33m[进程请求账号] \033[0m")
+                        user_input = input("\033[1;33m[👤 进程请求账号] \033[0m")
                         output_buffer.append(f"\n[Human Username Entered: {user_input}]\n")
-                        
                     child.sendline(user_input)
                     continue
-                # ------------------------------------------
-                
+                    
         except pexpect.EOF:
-            pass # 执行正常结束
+            pass
         except pexpect.TIMEOUT:
             sys.stdout.write(f"\n\033[1;31m[执行超时 ({timeout}s)]\033[0m\n")
             output_buffer.append(f"\n[Execution Timed Out after {timeout}s]")
-        
-        child.close()
+        except KeyboardInterrupt:
+            output_buffer.append("\n[Execution Aborted by User via Ctrl+C]")
+            raise
+        finally:
+            # 🛡️ 四步法：SIGKILL 进程组 → 等内核 → 排空缓冲区 → 关闭 PTY
+            if child is not None and child.isalive():
+                try:
+                    pgid = os.getpgid(child.pid)
+                    os.killpg(pgid, signal.SIGKILL)
+                    time.sleep(0.2)
+                    # 排空 PTY 缓冲区，消除幽灵输出
+                    try:
+                        while True:
+                            child.read_nonblocking(size=1024, timeout=0.01)
+                    except Exception:
+                        pass
+                except Exception:
+                    try:
+                        os.kill(child.pid, signal.SIGKILL)
+                    except Exception:
+                        pass
+                try:
+                    child.close(force=True)
+                except Exception:
+                    pass
+
         exit_status = child.exitstatus if child.exitstatus is not None else -1
         
-        # --- 给 AI 擦屁股：清理日志，提取核心摘要 ---
         full_output = "".join(output_buffer)
-        clean_output = re.sub(r'\x1b\[[0-9;]*m', '', full_output)  # 剔除颜色
-        clean_output = clean_output.replace('\r\n', '\n')          # 【核心修复】统一换行符
+        clean_output = re.sub(r'\x1b\[[0-9;]*m', '', full_output)
+        clean_output = clean_output.replace('\r\n', '\n')
         
         lines = []
         for line in clean_output.split('\n'):
             if '\r' in line:
-                line = line.split('\r')[-1] # 折叠各种下载和编译的 \r 进度条
-            if line.strip():                # 剔除空行
+                line = line.split('\r')[-1]
+            if line.strip():
                 lines.append(line.strip())
         
         final_clean = "\n".join(lines)
-        # 合并连续换行（修复 \r\n 边界截断导致的多余空行）
         final_clean = re.sub(r'\n{3,}', '\n\n', final_clean)
         
-        # 🚀 高级日志截断：掐头去尾防撑爆大模型
         MAX_LOG_LEN = 4000
         if len(final_clean) > MAX_LOG_LEN:
-            head_len = 1000  # 保留开头的 1000 字符（环境识别）
-            tail_len = 3000  # 保留结尾的 3000 字符（核心报错区）
+            head_len = 1000
+            tail_len = 3000
             omitted = len(final_clean) - MAX_LOG_LEN
-            
-            final_clean = (
-                final_clean[:head_len] +
-                f"\n\n... ( ✂️ Log too long. Omitted {omitted} characters in the middle ) ...\n\n" +
-                final_clean[-tail_len:]
-            )
+            final_clean = (final_clean[:head_len] + 
+                           f"\n\n... ( ✂️ Log too long. Omitted {omitted} characters in the middle ) ...\n\n" + 
+                           final_clean[-tail_len:])
 
         return f"Exit Code: {exit_status}\nTerminal Output:\n{final_clean}"
 
+    except KeyboardInterrupt:
+        # 确保外层的 try...except 能够完美捕捉，防止被底下的 Exception 拦截
+        raise
     except Exception as e:
         return f"Execution Error: {str(e)}"
 
@@ -191,7 +213,7 @@ class ExecuteBashTool(BaseTool):
     name = "execute_bash"
     description = "Run shell commands. Uses a pseudo-terminal (PTY) to stream output and capture results (including exit codes) for AI. Perfect for apt/pip installs."
     required_role = 3
-    timeout = 300  # 安装包可能耗时较长，放宽到 5 分钟
+    timeout = 30000  # 安装包可能耗时较长，放宽到更久
     parameters_schema = {
         "required": ["command"],
         "properties": {

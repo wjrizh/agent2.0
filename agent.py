@@ -19,6 +19,7 @@ import signal
 import threading
 import datetime  # <--- 新增：用于获取当前时间
 from openai import OpenAI
+import concurrent.futures
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
@@ -33,7 +34,9 @@ client = OpenAI(
 
 from agent_tools.manager import ToolManager
 from agent_tools.builtin_tools import WriteFileTool, ExecuteBashTool, ReadFileTool, ListDirTool, LaunchTerminalTool, DownloadFileTool, WebFetchTool, ReadEmailTool, SendEmailTool, DeleteEmailTool, UpdateFileTool, GitTool, GlobTool, GrepTool, TaskCreateTool, TaskUpdateTool, TaskListTool, TaskGetTool, WebSearchTool, AskUserQuestionTool, SubmitPlanTool, CronCreateTool, CronListTool, CronDeleteTool, _CRON_JOBS
-from agent_tools.kicad_tools import KiCadCombinedQueryTool, KiCadModifyTool
+
+from agent_tools.lsp_tool import LspTool
+from agent_tools.rag_tool import RagTool
 
 # 1. 实例化管理器（当前赋予管理员权限3）
 manager = ToolManager(current_user_role=3)
@@ -63,8 +66,9 @@ manager.register(SubmitPlanTool()) # <--- 新增：注册计划提交工具
 manager.register(CronCreateTool())   # <--- 新增：创建定时任务
 manager.register(CronListTool())     # <--- 新增：查询定时任务
 manager.register(CronDeleteTool())   # <--- 新增：删除定时任务
-manager.register(KiCadCombinedQueryTool())   # <--- 新增：KiCad 军工级融合查询工具
-manager.register(KiCadModifyTool())   # <--- 新增：KiCad PCB 修改工具
+
+manager.register(LspTool())              # <--- 新增：LSP 语法级代码智能
+manager.register(RagTool())              # <--- 新增：代码库 RAG 语义检索
 
 # 3. 完美兼容：生成与旧版完全一样的 tools 字典！
 tools = manager.get_agent_tools_dict()
@@ -73,23 +77,12 @@ tools = manager.get_agent_tools_dict()
 current_month = datetime.datetime.now().strftime("%Y-%m")
 
 # 全局变量：当前角色
-CURRENT_ROLE = "sysdev"  # 默认角色
 
-def get_role_tools(role: str) -> str:
-    """根据角色智能过滤可用工具，极大减少无关工具的干扰"""
-    # 系统工程师不需要 PCB 工具
-    sysdev_excludes = ["kicad_combined_query_tool", "kicad_modify_tool"]
-    # PCB 工程师只给核心必备工具
-    pcb_includes = ["kicad_combined_query_tool", "kicad_modify_tool", "read_file", "list_dir", "submit_plan", "ask_user_question"]
-    
+def get_all_tools() -> str:
+    """列出所有已注册工具"""
     lines = []
     idx = 1
     for name, tool in manager.tools.items():
-        if role == "sysdev" and name in sysdev_excludes:
-            continue
-        if role == "pcbengr" and name not in pcb_includes:
-            continue
-        
         lines.append(f"{idx}. {name}")
         lines.append(f"   Description: {tool.description}")
         lines.append(f"   Parameters:")
@@ -99,47 +92,26 @@ def get_role_tools(role: str) -> str:
         idx += 1
     return "\n".join(lines)
 
-def generate_system_prompt(role: str) -> str:
-    """按模块化拼装瘦身后的 System Prompt"""
+def generate_system_prompt() -> str:
+    """生成 System Prompt"""
     base_prompt = f"""Your name is 力工. You are a secure local developer agent.
 
-CRITICAL JSON RULE: When outputting JSON for tool calls, the content MUST be a strict single-line string. NEVER use physical line breaks inside string values. Escaped as \\n.
-You MUST use this exact JSON schema for tool calls: {{"tool": "<tool_name>", "arguments": {{<params>}}}}. Wrap it in a ```json code block.
+CRITICAL JSON RULE: Output tool calls in a strict single-line ```json block: {{"tool": "<name>", "arguments": {{<params>}}}}. No physical line breaks in strings. Use \n.
 
 Rules:
-1. ALWAYS wrap your Action in a ```json block. Stop generating text after your JSON block.
-2. For GUI apps or download/install commands, use 'launch_terminal'. For background commands, use 'execute_bash'.
-3. Your sudo password is 'zh030327'. Include it when needed.
-4. When a task is complete, output your text starting with "Final Answer:".
-5. ONLY use tools when necessary. For casual chat, respond directly WITHOUT generating any JSON block.
-6. ABSOLUTELY DO NOT use XML tags like <｜｜DSML｜｜...>. ONLY output standard Markdown ```json blocks.
-7. The current month is {current_month}.
+1. Wrap Actions in a ```json block and stop after it.
+2. Use 'launch_terminal' for GUI apps/installs, 'execute_bash' for background commands. NEVER add | tail/head/wc pipelines — the terminal needs real-time streaming, and the tool auto-truncates to 4000 chars for AI.
+3. Sudo password: 'zh030327'. Include it when needed.
+4. End tasks with "Final Answer:". For casual chat, reply without JSON.
+5. The current month is {current_month}.
+6. Role (SysDev): Practice "Minimalist Modification". Prefer update_file, never modify unread code. Maintain MEMORY.md <200 lines. Use tasks/plans for complex work.
 """
-    
-    if role == "sysdev":
-        role_prompt = """
-Current Role: System Software Engineer (SysDev)
-- Focus on robust code modification using update_file/write_file. Practice "Minimalist Modification".
-- Maintain persistent memory in MEMORY.md (Keep it under 200 lines).
-- Use tasks (task_create) and plans (submit_plan) for complex engineering.
-- NEVER propose changes to code you haven't read (use read_file first).
-"""
-    elif role == "pcbengr":
-        role_prompt = """
-Current Role: Hardware PCB Engineer (PCBEngr)
-- You MUST strictly follow 'PCB_LAYOUT_SOP.md'. Use read_file to read it FIRST.
-- Use `kicad_combined_query_tool` to understand netlists, physical bounds, and real device values.
-- Use `submit_plan` to propose specific coordinates BEFORE executing modifications.
-- Handle dry-run collision warnings iteratively. If a collision occurs during your dry_run, you MUST recalculate and try again until 0 collisions.
-"""
-    else:
-        role_prompt = ""
 
-    tools_str = get_role_tools(role)
-    return base_prompt + role_prompt + "\nAvailable Tools:\n" + tools_str
+    tools_str = get_all_tools()
+    return base_prompt + "\nAvailable Tools:\n" + tools_str
 
 # 初始化 System Prompt
-SYSTEM_PROMPT = generate_system_prompt(CURRENT_ROLE)
+SYSTEM_PROMPT = generate_system_prompt()
 
 # ---------------- 新增：自动记忆 (Auto Memory) 自动加载机制 ----------------
 def get_memory_context():
@@ -337,8 +309,7 @@ def ask_user_permission(tool_name: str, tool_args: dict) -> str:
     "write_file", "read_file", "list_dir", "task_create", "task_update",
     "task_list", "task_get", "glob_tool", "grep_tool", "submit_plan",
     "launch_terminal", "delete_email", "read_email",
-    "kicad_combined_query_tool", "kicad_modify_tool",
-    "web_search", "fetch_webpage", "git_tool"
+    "web_search", "fetch_webpage", "git_tool", "lsp_tool"
     ]
     if tool_name in safe_tools:
         return "Yes"
@@ -477,9 +448,14 @@ def _extract_json_blocks(content):
     """修复版：整体提取代码围栏内容，绝对禁止在围栏内使用括号匹配提前截断"""
     blocks = []
     
+    # --- 🛡️ 防火墙 1：预清洗 ---
+    # 剔除明确的非 json 代码块（如 ```python, ```text, ```cpp 等）
+    # 避免后续扫描到其他语言代码里包含的字典、结构体或花括号
+    clean_content = re.sub(r'```(?!json\b)[\w+-]*\s*\n.*?```', '', content, flags=re.DOTALL)
+    
     # 1. 严格限定只提取 ```json ... ``` 围栏内容
     fence_pattern = re.compile(r'```json\s*\n?(.*?)\n?```', re.DOTALL)
-    for match in fence_pattern.finditer(content):
+    for match in fence_pattern.finditer(clean_content):
         text = match.group(1).strip()
         if text:
             blocks.append(text)
@@ -487,11 +463,6 @@ def _extract_json_blocks(content):
     # 如果提取到了标准 json 代码块，直接返回。让后续处理完整的字符串
     if blocks:
         return [b for b in blocks if b.strip()]
-    
-    # --- 🛡️ 防火墙 1：预清洗 ---
-    # 剔除明确的非 json 代码块（如 ```python, ```text, ```cpp 等）
-    # 避免后续扫描到其他语言代码里包含的字典、结构体或花括号
-    clean_content = re.sub(r'```(?!json\b)[\w+-]+\s*\n.*?```', '', content, flags=re.DOTALL)
     
     # 👇👇👇 [新增：防火墙 1.5 - 输出流分段与截断] 👇👇👇
     # 如果文本中明确包含了 Final Answer:，说明后续为最终纯文本回答。
@@ -797,10 +768,18 @@ def run_agent(user_prompt):
                             if tool_name in tools:
                                 # -------- 核心防御：白名单严格过滤幻觉参数 --------
                                 if tool_name in manager.tools:
-                                    valid_keys = manager.tools[tool_name].parameters_schema.get("properties", {}).keys()
+                                    valid_keys = set(manager.tools[tool_name].parameters_schema.get("properties", {}).keys())
                                     if valid_keys:
-                                        # 严格剥离所有不属于该工具定义的字段（杜绝意外 TypeError）
+                                        # 1. 严格剥离幻觉字段
                                         tool_args = {k: v for k, v in tool_args.items() if k in valid_keys}
+                                        # 2. 容错：缺少必要参数时，尝试从 act 根级或嵌套参数中补回
+                                        missing = valid_keys - set(tool_args.keys())
+                                        if missing:
+                                            for mk in missing:
+                                                if mk in act:
+                                                    tool_args[mk] = act[mk]
+                                                elif raw_args and isinstance(raw_args, dict) and mk in raw_args:
+                                                    tool_args[mk] = raw_args[mk]
                                 # ------------------------------------------------
                                 
                                 # 邮箱账号处理（保持不变）
@@ -822,9 +801,14 @@ def run_agent(user_prompt):
                                 # 权限确认
                                 choice = ask_user_permission(tool_name, tool_args)
                                 if choice == "Yes":
-                                    # 执行工具，双引擎自动接管内部逻辑
-                                    obs = tools[tool_name](**tool_args)
-                                    observations.append(f"Observation from {tool_name}:\n{obs}")
+                                    # 移除僵尸线程池，改为同步执行，信任工具内部的超时与 Ctrl+C 管理
+                                    try:
+                                        obs = tools[tool_name](**tool_args)
+                                        observations.append(f"Observation from {tool_name}:\n{obs}")
+                                    except KeyboardInterrupt:
+                                        observations.append(f"Observation from {tool_name}:\nUser manually interrupted the execution via Ctrl+C.")
+                                    except Exception as e:
+                                        observations.append(f"Error executing tool '{tool_name}': {str(e)}")
                                 elif choice == "Switch Account":
                                     CURRENT_EMAIL_PROFILE = None
                                     console.print("[yellow]正在打开邮箱管理...[/yellow]")
@@ -1015,60 +999,7 @@ threading.Thread(target=cron_daemon, daemon=True).start()
 
 # ================== 以下是全新的启动与守护逻辑 ==================
 
-def choose_role_interactive(is_startup=False):
-    """终端垂直菜单：选择角色"""
-    options = ["1. 系统工程师 (SysDev) - 默认全能", "2. 硬件PCB工程师 (PCBEngr) - 专精布局"]
-    if not is_startup:
-        options.append("3. 取消 (保持当前角色)")
-        
-    selected_idx = 0
-    fd = sys.stdin.fileno()
-    old_settings = termios.tcgetattr(fd)
-    try:
-        tty.setraw(fd)
-        while True:
-            os.system('clear')
-            
-            if is_startup:
-                sys.stdout.write("\r\n \033[1;36m力工 Agent 启动 - 请选择初始角色\033[0m\r\n\r\n")
-            else:
-                sys.stdout.write("\r\n \033[1;36m切换力工的职业形态：\033[0m\r\n\r\n")
-            
-            for i, opt in enumerate(options):
-                if i == selected_idx:
-                    sys.stdout.write(f"   \033[92m❯ {opt}\033[0m\r\n")
-                else:
-                    sys.stdout.write(f"     {opt}\r\n")
-                    
-            sys.stdout.write("\r\n \033[2m(上下键选择 · Enter 确认)\033[0m\r\n")
-            sys.stdout.flush()
-            
-            char = sys.stdin.read(1)
-            if char == '\x1b':
-                seq = sys.stdin.read(2)
-                if seq == '[A': selected_idx = (selected_idx - 1) % len(options)
-                elif seq == '[B': selected_idx = (selected_idx + 1) % len(options)
-            elif char in ['1', '2', '3']:
-                idx = int(char) - 1
-                if idx < len(options):
-                    selected_idx = idx
-                    break
-            elif char == '\r':
-                break
-            elif char == '\x03':
-                sys.stdout.write("\n\r")
-                if is_startup:
-                    cleanup_everything()
-                    sys.exit(0)
-                else:
-                    return None
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-        sys.stdout.write("\n")
-        
-    if not is_startup and selected_idx == len(options) - 1:
-        return None
-    return "sysdev" if selected_idx == 0 else "pcbengr"
+
 
 def main():
     
@@ -1090,7 +1021,7 @@ def main():
             print(f"✅ 登录状态已保存到 {state_file}")
         sys.exit(0)
 
-    global chat_history, CURRENT_EMAIL_PROFILE, BRIDGE_PROC, CURRENT_ROLE, SYSTEM_PROMPT
+    global chat_history, CURRENT_EMAIL_PROFILE, BRIDGE_PROC, SYSTEM_PROMPT
     # ================= 以下内容和原 if __name__ == "__main__" 完全一致 ================= 
     # 0. 拉起后台 (静默启动，不在第一屏抢戏) 
     if not start_and_watch_bridge(): 
@@ -1148,11 +1079,6 @@ def main():
     if selected_idx == 1: 
         sys.exit(0)   # 清理工作交给 finally 统一处理 
 
-    # ================= 新增：启动时选择初始角色 ================= 
-    initial_role = choose_role_interactive(is_startup=True) 
-    CURRENT_ROLE = initial_role 
-    SYSTEM_PROMPT = generate_system_prompt(CURRENT_ROLE) 
-     
     # 初始化历史记录 
     with chat_history_lock: 
         chat_history.clear() 
@@ -1315,33 +1241,6 @@ def main():
                     console.print(f"[red]无法连接到 Bridge 服务: {e}[/red]")
                 continue
 
-            # 角色切换命令 (升级垂直菜单版)
-            role_commands = ["/role", "切换角色", "角色切换"]
-            if any(task.strip().lower().startswith(cmd) for cmd in role_commands):
-                new_role = choose_role_interactive(is_startup=False)
-                
-                # 选完后清屏并重新打印 Logo，保持工作台整洁美观
-                os.system('clear')
-                console.print(Align.center(welcome_panel))
-                
-                if new_role is None:
-                    console.print("\n[yellow]角色切换已取消。[/yellow]")
-                    continue
-
-                if new_role != CURRENT_ROLE:
-                    CURRENT_ROLE = new_role
-                    SYSTEM_PROMPT = generate_system_prompt(CURRENT_ROLE)
-                    
-                    with chat_history_lock:
-                        chat_history.clear()
-                        chat_history.append({"role": "system", "content": SYSTEM_PROMPT + get_memory_context()})
-                        chat_history.append({"role": "system", "content": f"Working directory is: {cwd}"})
-                    
-                    console.print(f"\n[bold green]✅ 已成功切换至 {'系统工程师 (SysDev)' if new_role == 'sysdev' else '硬件PCB工程师 (PCBEngr)'}！[/bold green]")
-                    console.print("[dim]历史聊天上下文已清空释放，力工以满血状态就绪。[/dim]")
-                else:
-                    console.print("\n[yellow]当前已经是该角色。[/yellow]")
-                continue
 
             if task.startswith("/file "):
                 file_path = task.replace("/file ", "").strip()

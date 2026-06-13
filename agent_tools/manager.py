@@ -34,9 +34,8 @@ class ToolManager:
                     raise ValueError(f"Schema Validation Failed: {val_msg}")
 
                 # 【第二层：调用中执行与监控 - In-flight】
-                # 带有超时的异步执行
-                future = self.executor.submit(tool.run, **kwargs)
-                result = future.result(timeout=tool.timeout)
+                # 同步直接调用，确保 Ctrl+C 等信号能直达工具内部处理
+                result = tool.run(**kwargs)
                 
                 # 【第三层：结果校验 - Post-flight】
                 if not isinstance(result, str):
