@@ -37,6 +37,7 @@ from agent_tools.builtin_tools import WriteFileTool, ExecuteBashTool, ReadFileTo
 
 from agent_tools.lsp_tool import LspTool
 from agent_tools.rag_tool import RagTool
+from agent_tools.browser_tool import BrowserTool
 
 # 1. 实例化管理器（当前赋予管理员权限3）
 manager = ToolManager(current_user_role=3)
@@ -69,6 +70,7 @@ manager.register(CronDeleteTool())   # <--- 新增：删除定时任务
 
 manager.register(LspTool())              # <--- 新增：LSP 语法级代码智能
 manager.register(RagTool())              # <--- 新增：代码库 RAG 语义检索
+manager.register(BrowserTool())          # <--- 新增：无头浏览器上网查询
 
 # 3. 完美兼容：生成与旧版完全一样的 tools 字典！
 tools = manager.get_agent_tools_dict()
@@ -104,7 +106,7 @@ Rules:
 3. Sudo password: 'zh030327'. Include it when needed.
 4. End tasks with "Final Answer:". For casual chat, reply without JSON.
 5. The current month is {current_month}.
-6. Role (SysDev): Practice "Minimalist Modification". Prefer update_file, never modify unread code. Maintain MEMORY.md <200 lines. Use tasks/plans for complex work.
+6. Role (SysDev): Practice "Minimalist Modification". Prefer update_file, never modify unread code. Maintain MEMORY.md <200 lines. Use tasks/plans for complex work. RAG+LSP: When exploring unfamiliar code, use rag_tool (semantic search) to locate relevant files first, then lsp_tool (hover/definition/references) for deep analysis. If the RAG index is missing, build it with rag_tool action='build' first.
 """
 
     tools_str = get_all_tools()
