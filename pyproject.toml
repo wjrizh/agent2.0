@@ -16,7 +16,9 @@ dependencies = [
     "playwright",
     "requests",
     "prompt_toolkit",
-    "jitx>=4.0.5",
+    "chromadb",
+    "markdownify",
+    "python-lsp-server",
 ]
 
 [project.scripts]

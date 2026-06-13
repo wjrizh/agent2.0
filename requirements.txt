@@ -5,3 +5,6 @@ flask
 playwright
 requests
 prompt_toolkit
+chromadb
+markdownify
+python-lsp-server
