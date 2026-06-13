@@ -33,11 +33,12 @@ client = OpenAI(
 )
 
 from agent_tools.manager import ToolManager
-from agent_tools.builtin_tools import WriteFileTool, ExecuteBashTool, ReadFileTool, ListDirTool, LaunchTerminalTool, DownloadFileTool, WebFetchTool, ReadEmailTool, SendEmailTool, DeleteEmailTool, UpdateFileTool, GitTool, GlobTool, GrepTool, TaskCreateTool, TaskUpdateTool, TaskListTool, TaskGetTool, WebSearchTool, AskUserQuestionTool, SubmitPlanTool, CronCreateTool, CronListTool, CronDeleteTool, _CRON_JOBS
+from agent_tools.builtin_tools import WriteFileTool, ExecuteBashTool, ReadFileTool, ListDirTool, LaunchTerminalTool, DownloadFileTool, ReadEmailTool, SendEmailTool, DeleteEmailTool, UpdateFileTool, GitTool, GlobTool, GrepTool, TaskCreateTool, TaskUpdateTool, TaskListTool, TaskGetTool, AskUserQuestionTool, SubmitPlanTool, CronCreateTool, CronListTool, CronDeleteTool, _CRON_JOBS
 
 from agent_tools.lsp_tool import LspTool
 from agent_tools.rag_tool import RagTool
 from agent_tools.browser_tool import BrowserTool
+from agent_tools.download_tool import DownloadTool
 
 # 1. 实例化管理器（当前赋予管理员权限3）
 manager = ToolManager(current_user_role=3)
@@ -49,7 +50,6 @@ manager.register(ReadFileTool())
 manager.register(ListDirTool())
 manager.register(LaunchTerminalTool())  # <--- 新增这行
 manager.register(DownloadFileTool())      # <--- 新增：网络文件下载
-manager.register(WebFetchTool())          # <--- 新增：网页内容读取
 manager.register(ReadEmailTool())         # <--- 新增：IMAP 邮件读取
 manager.register(SendEmailTool())          # <--- 新增：SMTP 邮件发送
 manager.register(DeleteEmailTool())        # <--- 新增：IMAP 邮件删除
@@ -61,7 +61,7 @@ manager.register(TaskCreateTool())   # <--- 新增：任务创建
 manager.register(TaskUpdateTool())   # <--- 新增：任务更新
 manager.register(TaskListTool())     # <--- 新增：任务列表查询
 manager.register(TaskGetTool())      # <--- 新增：任务详情查询
-manager.register(WebSearchTool())    # <--- 新增：网页搜索工具
+
 manager.register(AskUserQuestionTool()) # <--- 新增：注册提问交互工具
 manager.register(SubmitPlanTool()) # <--- 新增：注册计划提交工具
 manager.register(CronCreateTool())   # <--- 新增：创建定时任务
@@ -71,6 +71,7 @@ manager.register(CronDeleteTool())   # <--- 新增：删除定时任务
 manager.register(LspTool())              # <--- 新增：LSP 语法级代码智能
 manager.register(RagTool())              # <--- 新增：代码库 RAG 语义检索
 manager.register(BrowserTool())          # <--- 新增：无头浏览器上网查询
+manager.register(DownloadTool())          # <--- 新增：PTY流式文件下载
 
 # 3. 完美兼容：生成与旧版完全一样的 tools 字典！
 tools = manager.get_agent_tools_dict()
@@ -135,6 +136,27 @@ chat_history_lock = threading.Lock()
 
 # 全局存储当前选定的邮箱账号，实现"一次选择，持续使用"
 CURRENT_EMAIL_PROFILE = None
+
+# ========== 无畏模式 (Fearless Mode) ==========
+FEARLESS_MODE = False  # 全局开关：开启后所有命令直接执行，无需用户确认
+
+def toggle_fearless_mode(enable: bool):
+    global FEARLESS_MODE
+    FEARLESS_MODE = enable
+    mode_text = "🔥 无畏模式已开启 — 所有命令将自动执行" if enable else "🛡️ 安全模式已恢复 — 危险命令需要用户确认"
+    console.print(f"\n[bold yellow]{mode_text}[/bold yellow]\n")
+    return FEARLESS_MODE
+
+# 无畏模式下的禁止命令黑名单（仅拦截可能导致系统不可用或数据丢失的命令）
+FEARLESS_BLACKLIST = [
+    "rm -rf /", "rm -rf /*", "rm -rf ~", "rm -rf .", "rm -rf *",
+    "rm -fr /", "rm -fr /*", "rm -fr ~", "rm -fr .", "rm -fr *",
+    "dd if=", "mkfs.", ":(){ :|:& };:",  # fork bomb
+    "apt purge linux-image", "apt-get purge linux-image",  # 卸载内核
+    "apt remove linux-image", "apt-get remove linux-image",
+    "rm -rf /boot", "rm -rf /lib", "rm -rf /bin", "rm -rf /sbin",
+    "rm -rf /etc", "rm -rf /usr", "rm -rf /var",
+]
 
 def clean_reply(content: str) -> str:
     """从 AI 原始回复中提取最终答案，移除前缀和 JSON 噪声"""
@@ -296,6 +318,16 @@ def handle_email_selection() -> dict:
 def ask_user_permission(tool_name: str, tool_args: dict) -> str:
     """渲染仿 Claude Code 风格的自然语言确认界面"""
     
+    # ========== 无畏模式 (Fearless Mode) ==========
+    if FEARLESS_MODE:
+        # 仅拦截黑名单中的破坏性命令
+        if tool_name == "execute_bash":
+            command = tool_args.get("command", "").lower().replace("  ", " ")
+            for blocked in FEARLESS_BLACKLIST:
+                if blocked in command:
+                    return f"No (Blocked by Fearless Mode: '{blocked}' is forbidden)"
+        return "Yes"
+    
     # --- 辅助函数：检测外部启动器（浏览器、媒体等）---
     def is_external_launcher(cmd: str) -> bool:
         """判断命令是否为打开外部程序/网址的操作"""
@@ -311,7 +343,7 @@ def ask_user_permission(tool_name: str, tool_args: dict) -> str:
     "write_file", "read_file", "list_dir", "task_create", "task_update",
     "task_list", "task_get", "glob_tool", "grep_tool", "submit_plan",
     "launch_terminal", "delete_email", "read_email",
-    "web_search", "fetch_webpage", "git_tool", "lsp_tool"
+    "git_tool", "lsp_tool", "browser_tool", "debug_tool"
     ]
     if tool_name in safe_tools:
         return "Yes"
@@ -319,6 +351,20 @@ def ask_user_permission(tool_name: str, tool_args: dict) -> str:
     # --- 2. 对 execute_bash 的分级处理 ---
     if tool_name == "execute_bash":
         command = tool_args.get("command", "")
+        
+        # --- 💡 扩展：安全只读命令白名单（直接放行，不弹窗）---
+        safe_prefixes = [
+            "dpkg -l", "dpkg -s", "apt list", "apt search", "apt show", 
+            "apt update", "apt-get update",  # <--- 补充：放行安全无害的索引更新操作
+            "pip list", "pip show", "ls ", "cat ", "echo ", "grep ", 
+            "which ", "find ", "pwd", "whoami", "history", "tail ", "head "
+        ]
+        
+        # 剔除 sudo 干扰后进行匹配（即使是 sudo dpkg -l 也会被放行）
+        core_cmd = command.replace("sudo ", "").strip()
+        if any(core_cmd.startswith(safe) for safe in safe_prefixes):
+            return "Yes"
+        # --------------------------------------------------------
         
         # 判断是否为安装/卸载命令
         def is_install_or_uninstall(cmd: str) -> bool:
@@ -343,8 +389,8 @@ def ask_user_permission(tool_name: str, tool_args: dict) -> str:
         elif is_external_launcher(command):
             action_text = f"open/execute [bold white]{command}[/bold white]"
         else:
-            # 其他普通命令 → 直接通过（如 ls、cat 等）
-            return "Yes"
+            # 2c. 其他所有未明确豁免的命令（包括未知的 sudo 操作等）也要弹窗
+            action_text = f"run command [bold white]{command}[/bold white]"
     else:
         # 非 execute_bash 工具（如 send_email、download_file 等）仍按原来方式弹窗
         descriptions = {
@@ -389,7 +435,7 @@ def ask_user_permission(tool_name: str, tool_args: dict) -> str:
                 elif c3 == 'D': selected_idx = (selected_idx - 1) % len(options)
                 draw_menu()
             elif char == '\r':
-                sys.stdout.write("\n")
+                sys.stdout.write("\r\033[2K\n")  # 回车到行首 + 清除残留在本行的空格 + 换行
                 break
             elif char == '\x03':
                 sys.stdout.write("\n")
@@ -447,48 +493,60 @@ def _escape_newlines_in_json_strings(raw_json: str) -> str:
     return "".join(result)
 
 def _extract_json_blocks(content):
-    """修复版：整体提取代码围栏内容，绝对禁止在围栏内使用括号匹配提前截断"""
+    # 1. 预处理：截断 Final Answer 之后的所有内容，防止干扰
+    if "Final Answer:" in content:
+        content = content.split("Final Answer:")[0]
+
     blocks = []
+    in_json_block = False
+    current_block = []
     
-    # --- 🛡️ 防火墙 1：预清洗 ---
-    # 剔除明确的非 json 代码块（如 ```python, ```text, ```cpp 等）
-    # 避免后续扫描到其他语言代码里包含的字典、结构体或花括号
-    clean_content = re.sub(r'```(?!json\b)[\w+-]*\s*\n.*?```', '', content, flags=re.DOTALL)
-    
-    # 1. 严格限定只提取 ```json ... ``` 围栏内容
-    fence_pattern = re.compile(r'```json\s*\n?(.*?)\n?```', re.DOTALL)
-    for match in fence_pattern.finditer(clean_content):
-        text = match.group(1).strip()
-        if text:
-            blocks.append(text)
-    
-    # 如果提取到了标准 json 代码块，直接返回。让后续处理完整的字符串
-    if blocks:
-        return [b for b in blocks if b.strip()]
-    
-    # 👇👇👇 [新增：防火墙 1.5 - 输出流分段与截断] 👇👇👇
-    # 如果文本中明确包含了 Final Answer:，说明后续为最终纯文本回答。
-    # 截断它，不让后续的裸括号扫描机制误判 URL 参数或说明文字中的花括号
-    if "Final Answer:" in clean_content:
-        clean_content = clean_content.split("Final Answer:")[0]
-    # 👆👆👆 ========================================== 👆👆👆
-    
-    # 2. 回退机制：全文无 json 围栏时，继续用括号提取裸露的 JSON
-    # (完美兼容无语言标记的裸围栏 ``` {...} ``` 或纯文本里的调用)
-    idx = 0
-    while idx < len(clean_content):
-        if clean_content[idx] == '{':
-            block = _parse_balanced_json(clean_content, idx)
-            if block:
-                # --- 🛡️ 防火墙 2：特征校验 ---
-                # 终极防御：如果是在正文中裸抓的 {}，它必须看起来像个工具调用才行！
-                # 过滤掉偶然匹配到的 C语言块、Python字典、Bash扩展 {1..5} 等垃圾文本
-                if '"tool"' in block or '"action"' in block or '"name"' in block:
-                    blocks.append(block)
-                idx = clean_content.index(block, idx) + len(block)
+    # 新增：字符串状态追踪器，防止 JSON 内部的纯文本 ``` 导致提前截断
+    in_string = False
+    escape_count = 0
+
+    lines = content.split('\n')
+    for line in lines:
+        stripped = line.strip()
+
+        # 检测到 json 开始围栏
+        if not in_json_block and stripped.lower().startswith('```json'):
+            in_json_block = True
+            current_block = []
+            in_string = False
+            escape_count = 0
+            continue
+
+        if in_json_block:
+            # 只有在非字符串内部时，遇到纯粹的 ``` 才认为是 JSON 的结束围栏
+            if not in_string and stripped.startswith('```') and len(stripped.replace('`', '').strip()) == 0:
+                in_json_block = False
+                block_content = '\n'.join(current_block).strip()
+                
+                # 【核心修复 1】物理空块过滤：丢弃空块，彻底杜绝 json.loads("") 崩溃
+                if block_content:  
+                    blocks.append(block_content)
+                current_block = []
                 continue
-        idx += 1
-        
+
+            current_block.append(line)
+            
+            # 【核心修复 2】实时追踪当前行是否处于 JSON 字符串内部
+            for char in line:
+                if char == '\\':
+                    escape_count += 1
+                else:
+                    # 遇到双引号，且前面的反斜杠是偶数个（未被转义），则切换字符串状态
+                    if char == '"' and escape_count % 2 == 0:
+                        in_string = not in_string
+                    escape_count = 0
+
+    # 兜底：如果没遇到结束围栏（内容被硬截断），也把已有的内容提取出来，交给 repair_json 修复
+    if in_json_block:
+        block_content = '\n'.join(current_block).strip()
+        if block_content:
+            blocks.append(block_content)
+
     return blocks
 
 def _parse_balanced_json(text, start): 
@@ -736,6 +794,10 @@ def run_agent(user_prompt):
                             pass
                             
                         repaired_json_str = repair_json(raw_json)
+                        # 👇 终极防线：拦截空块，防止 json.loads("") 崩溃
+                        if not repaired_json_str.strip():
+                            continue
+                        # 👆 ==================
                         action_data = json.loads(repaired_json_str, strict=False)
                         
                         # ---> 核心修复：兼容 json_repair 将多个对象合并修复为列表的情况 <---
@@ -1243,6 +1305,18 @@ def main():
                     console.print(f"[red]无法连接到 Bridge 服务: {e}[/red]")
                 continue
 
+
+            # 无畏模式切换命令
+            fearless_commands = ["/fearless", "无畏模式", "fearless mode"]
+            if task.strip().lower().startswith(tuple(fearless_commands)):
+                task_lower = task.strip().lower()
+                if "on" in task_lower or "开启" in task_lower or "enable" in task_lower or task_lower in ["/fearless", "无畏模式"]:
+                    toggle_fearless_mode(True)
+                elif "off" in task_lower or "关闭" in task_lower or "disable" in task_lower:
+                    toggle_fearless_mode(False)
+                else:
+                    console.print("[yellow]用法: /fearless on 或 /fearless off[/yellow]")
+                continue
 
             if task.startswith("/file "):
                 file_path = task.replace("/file ", "").strip()

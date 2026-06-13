@@ -60,11 +60,14 @@ class WriteFileTool(BaseTool):
         return f"File '{path}' written successfully to sandbox."
 
 # ----------------- 全局 PTY 执行引擎 (专治进度条吞字、交互式卡死与僵尸进程) -----------------
+# ----------------- 全局 PTY 执行引擎 -----------------
 def run_pty_command(command: str, header_msg: str, timeout: int = 30000, sudo_password: str = None, repo_path: str = None) -> str:
-    """全局 PTY (伪终端) 执行引擎，专治进度条吞字、交互式卡死与僵尸进程"""
+    """全局 PTY (伪终端) 执行引擎，处理进度条覆写、交互式提权与超时控制"""
     import os
     import signal
     import getpass
+    import shlex
+    import re
 
     if header_msg:
         sys.stdout.write(f"\n\033[1;36m{header_msg}\033[0m\n")
@@ -72,76 +75,101 @@ def run_pty_command(command: str, header_msg: str, timeout: int = 30000, sudo_pa
 
     child = None
     try:
-        env_cmd = "export TERM=xterm; export DEBIAN_FRONTEND=noninteractive; export GIT_TERMINAL_PROMPT=1; "
+        # 1. 环境准备
+        env_prefix = "export TERM=xterm; export DEBIAN_FRONTEND=noninteractive; export GIT_TERMINAL_PROMPT=1; "
+        pre_cmd = ""
+        
         if repo_path:
             safe_repo = _secure_path(repo_path)
             if not os.path.exists(safe_repo):
                 return f"Error: The directory '{repo_path}' does not exist."
-            env_cmd += f"cd {safe_repo} && "
-        env_cmd += command
+            pre_cmd = f"cd {safe_repo} && "
 
-        # 自动剥离会缓冲/吞掉流式输出的管道（tail/head/wc/grep -c 等）
-        import re
-        blocked_patterns = [
-            r'\|\s*tail\s+-\d+',   # | tail -10
-            r'\|\s*head\s+-\d+',   # | head -5
-            r'\|\s*wc\s+-l',        # | wc -l
-            r'\|\s*grep\s+-c',       # | grep -c
-        ]
-        for pat in blocked_patterns:
-            if re.search(pat, env_cmd):
-                return (
-                    "Error: Your command contains a pipeline (e.g. | tail -10) "
-                    "that would buffer output and hide real-time progress. "
-                    "Remove the pipeline and let the tool's built-in truncation "
-                    "(last 4000 chars sent to AI) handle the summary for you."
-                )
+        # 拦截会吞噬实时流的管道命令
+        blocked_patterns = [r'\|\s*tail\s+-\d+', r'\|\s*head\s+-\d+', r'\|\s*wc\s+-l', r'\|\s*grep\s+-c']
+        if any(re.search(pat, command) for pat in blocked_patterns):
+            return (
+                "Error: Your command contains a pipeline (e.g. | tail -10) that buffers output. "
+                "Remove the pipeline; the tool automatically truncates long output for AI context."
+            )
 
+        # 2. 命令拼装
+        # 移除 echo | sudo -S 管道注入，因为管道会剥夺后续命令 (如 apt) 的标准输入，导致它们遇到交互直接 EOF 中止。
+        # 使用 sudo -k 强制清除缓存并触发 PTY 密码提示，依赖下方的 AUTO_REPLIES 动态输入，完美保留 stdin 供后续程序使用。
+        final_command = command
         if sudo_password and "sudo " in command:
-            child = pexpect.spawn('/bin/bash', ['-c', env_cmd.replace('sudo ', 'sudo -S ')], encoding='utf-8', timeout=timeout)
-            child.expect(['[sudo] password', '[P|p]assword'])
-            child.sendline(sudo_password)
-        else:
-            child = pexpect.spawn('/bin/bash', ['-c', env_cmd], encoding='utf-8', timeout=timeout)
+            # 只替换第一个 sudo 为 sudo -k，防止复杂命令中多次验证
+            final_command = command.replace("sudo ", "sudo -k ", 1)
+            
+        full_cmd = f"{env_prefix}{pre_cmd}{final_command}"
+        child = pexpect.spawn('/bin/bash', ['-c', full_cmd], encoding='utf-8', codec_errors='replace', timeout=timeout)
 
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+        
+        # 3. 状态与缓冲区初始化
+        sudo_password_sent = False
         output_buffer = []
+        tail_buffer = ""
+        
+        # 4. 主监听循环
         try:
             while True:
                 chunk = child.read_nonblocking(size=1024, timeout=timeout)
-                display_chunk = chunk.replace('\r\n', '\n')
-                sys.stdout.write(display_chunk)
+                sys.stdout.write(chunk.replace('\r\n', '\n'))
                 sys.stdout.flush()
                 output_buffer.append(chunk)
                 
-                tail = "".join(output_buffer[-5:])
-                clean_tail = re.sub(r'\x1b\[[0-9;]*m', '', tail)
+                # 维护用于提示符匹配的滑动窗口
+                tail_buffer += chunk
+                if len(tail_buffer) > 2048:
+                    tail_buffer = tail_buffer[-1024:]
+                
+                # 清除 ANSI 色彩以保证正则匹配准确
+                clean_tail = re.sub(r'\x1b\[[0-9;]*m', '', tail_buffer)
                 
                 AUTO_REPLIES = [
+                    (r'\[sudo\].*(password|密码)', sudo_password if sudo_password else 'zh030327'),
                     (r'Proceed \([Yy]/[Nn]\)\?\s*$', 'Y'),
                     (r'Do you want to continue\? \[[Yy]/[Nn]\]\s*$', 'Y'),
                     (r'Is this OK\? \(yes\)\s*$', 'yes'),
                     (r'continue connecting \(yes/no/\[fingerprint\]\)\?\s*$', 'yes'),
-                    (r'continue connecting \(yes/no\)\?\s*$', 'yes')
+                    (r'continue connecting \(yes/no\)\?\s*$', 'yes'),
+                    (r'您希望继续执行吗\？\s*\[[Yy]/[Nn]\]\s*$', 'Y'),
+                    (r'是否继续\？\s*\[[Yy]/[Nn]\]\s*$', 'Y')
                 ]
                 
-                replied = False
+                # 自动回复机制
                 for pattern, reply in AUTO_REPLIES:
                     if re.search(pattern, clean_tail):
+                        if 'sudo' in pattern and sudo_password_sent:
+                            continue
+                        
                         child.sendline(reply)
-                        replied = True
+                        output_buffer.append(f"\n[Auto reply sent by Agent: {reply}]\n")
+                        
+                        if 'sudo' in pattern:
+                            sudo_password_sent = True
+                            
+                        # 匹配成功后清空窗口，防止同一个提示符重复触发
+                        tail_buffer = ""
                         break
-                if replied: continue
                 
+                # 手动交互接管
                 if re.search(r'([Uu]sername|[Pp]assword|[Pp]assphrase).*:\s*$', clean_tail):
                     is_pwd = bool(re.search(r'[Pp]assword|[Pp]assphrase', clean_tail))
                     sys.stdout.write("\n")
-                    if is_pwd:
+                    if is_pwd and sudo_password:
+                        child.sendline(sudo_password)
+                        output_buffer.append("\n[Auto sudo password sent]\n")
+                    elif is_pwd:
                         user_input = getpass.getpass("\033[1;33m[🔒 进程请求密码 (你的输入不可见)] \033[0m")
                         output_buffer.append("\n[Human Password Entered Securely]\n")
+                        child.sendline(user_input)
                     else:
                         user_input = input("\033[1;33m[👤 进程请求账号] \033[0m")
                         output_buffer.append(f"\n[Human Username Entered: {user_input}]\n")
-                    child.sendline(user_input)
+                        child.sendline(user_input)
                     continue
                     
         except pexpect.EOF:
@@ -153,13 +181,12 @@ def run_pty_command(command: str, header_msg: str, timeout: int = 30000, sudo_pa
             output_buffer.append("\n[Execution Aborted by User via Ctrl+C]")
             raise
         finally:
-            # 🛡️ 四步法：SIGKILL 进程组 → 等内核 → 排空缓冲区 → 关闭 PTY
+            # 安全释放进程与清理 PTY
             if child is not None and child.isalive():
                 try:
                     pgid = os.getpgid(child.pid)
                     os.killpg(pgid, signal.SIGKILL)
                     time.sleep(0.2)
-                    # 排空 PTY 缓冲区，消除幽灵输出
                     try:
                         while True:
                             child.read_nonblocking(size=1024, timeout=0.01)
@@ -175,35 +202,51 @@ def run_pty_command(command: str, header_msg: str, timeout: int = 30000, sudo_pa
                 except Exception:
                     pass
 
+        # 5. 输出格式化与清洗引擎
         exit_status = child.exitstatus if child.exitstatus is not None else -1
-        
         full_output = "".join(output_buffer)
-        clean_output = re.sub(r'\x1b\[[0-9;]*m', '', full_output)
-        clean_output = clean_output.replace('\r\n', '\n')
+        
+        # 步骤 5.1: 彻底清除 ANSI 控制符（颜色、光标移动、清行等）
+        clean_output = re.sub(r'\x1b\[[0-9;?]*[a-zA-Z]', '', full_output)
         
         lines = []
+        # 步骤 5.2: PTY 默认使用 \r\n 换行，直接按 \n 分割进行逐行解析
         for line in clean_output.split('\n'):
+            # 步骤 5.3: 去除行尾多余的 \r，防止多重回车符污染数据
+            line = line.rstrip('\r')
+            
+            # 步骤 5.4: 处理进度条覆写 (\r 会使光标回到行首，因此只取最终结果)
             if '\r' in line:
                 line = line.split('\r')[-1]
-            if line.strip():
-                lines.append(line.strip())
+                
+            line = line.strip()
+            if line:
+                lines.append(line)
         
-        final_clean = "\n".join(lines)
-        final_clean = re.sub(r'\n{3,}', '\n\n', final_clean)
+        # 步骤 5.5: 组装清洗后的纯净日志，消除大面积空行
+        full_output = "\n".join(lines)
+        full_output = re.sub(r'\n{3,}', '\n\n', full_output)
         
-        MAX_LOG_LEN = 4000
-        if len(final_clean) > MAX_LOG_LEN:
-            head_len = 1000
-            tail_len = 3000
-            omitted = len(final_clean) - MAX_LOG_LEN
-            final_clean = (final_clean[:head_len] + 
-                           f"\n\n... ( ✂️ Log too long. Omitted {omitted} characters in the middle ) ...\n\n" + 
-                           final_clean[-tail_len:])
+        # 6. 上下文截断保护 (Sandwich Truncation)
+        lines_split = full_output.split('\n')
+        if len(lines_split) > 600:
+            head = '\n'.join(lines_split[:100])
+            tail = '\n'.join(lines_split[-500:])
+            omitted_count = len(lines_split) - 600
+            
+            full_output = (
+                f"{head}\n\n"
+                f"=================================================================\n"
+                f"... [System Directive to AI: 终端输出超长，中间的 {omitted_count} 行已被系统安全截断] ...\n"
+                f"... [注意：真实用户已经在本地终端完整看过了整个执行过程] ...\n"
+                f"... [请直接根据下方保留的最后 500 行日志（通常包含报错或结果）继续分析] ...\n"
+                f"=================================================================\n\n"
+                f"{tail}"
+            )
 
-        return f"Exit Code: {exit_status}\nTerminal Output:\n{final_clean}"
+        return f"Exit Code: {exit_status}\nTerminal Output:\n{full_output}"
 
     except KeyboardInterrupt:
-        # 确保外层的 try...except 能够完美捕捉，防止被底下的 Exception 拦截
         raise
     except Exception as e:
         return f"Execution Error: {str(e)}"
