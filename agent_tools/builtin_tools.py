@@ -77,7 +77,7 @@ def run_pty_command(command: str, header_msg: str, timeout: int = 30000, sudo_pa
     child = None
     try:
         # 1. 环境准备
-        env_prefix = "export TERM=xterm; export DEBIAN_FRONTEND=noninteractive; export PYTHONUNBUFFERED=1; export GIT_TERMINAL_PROMPT=1; export GIT_PAGER=cat; "
+        env_prefix = "export TERM=xterm; export DEBIAN_FRONTEND=noninteractive; export PYTHONUNBUFFERED=1; export GIT_TERMINAL_PROMPT=1; export GIT_PAGER=cat; export SYSTEMD_PAGER=cat; export PAGER=cat; "
         pre_cmd = ""
         
         if repo_path:
@@ -199,8 +199,9 @@ def run_pty_command(command: str, header_msg: str, timeout: int = 30000, sudo_pa
         exit_status = child.exitstatus if child.exitstatus is not None else -1
         full_output = "".join(output_buffer)
         
-        # 步骤 5.1: 彻底清除 ANSI 控制符（颜色、光标移动、清行等）
-        clean_output = re.sub(r'\x1b\[[0-9;?]*[a-zA-Z]', '', full_output)
+        # 步骤 5.1: 彻底清除 ANSI 控制符（颜色、光标移动、清行等）+ OSC 超链接
+        clean_output = re.sub(r'\x1b\][^\x07]*\x07', '', full_output)  # OSC 序列
+        clean_output = re.sub(r'\x1b\[[0-9;?]*[a-zA-Z]', '', clean_output)
         
         lines = []
         # 步骤 5.2: PTY 默认使用 \r\n 换行，直接按 \n 分割进行逐行解析
