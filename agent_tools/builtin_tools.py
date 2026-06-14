@@ -68,6 +68,7 @@ def run_pty_command(command: str, header_msg: str, timeout: int = 30000, sudo_pa
     import getpass
     import shlex
     import re
+    import tempfile
 
     if header_msg:
         sys.stdout.write(f"\n\033[1;36m{header_msg}\033[0m\n")
@@ -76,7 +77,7 @@ def run_pty_command(command: str, header_msg: str, timeout: int = 30000, sudo_pa
     child = None
     try:
         # 1. 环境准备
-        env_prefix = "export TERM=xterm; export DEBIAN_FRONTEND=noninteractive; export GIT_TERMINAL_PROMPT=1; "
+        env_prefix = "export TERM=xterm; export DEBIAN_FRONTEND=noninteractive; export PYTHONUNBUFFERED=1; export GIT_TERMINAL_PROMPT=1; "
         pre_cmd = ""
         
         if repo_path:
@@ -84,14 +85,6 @@ def run_pty_command(command: str, header_msg: str, timeout: int = 30000, sudo_pa
             if not os.path.exists(safe_repo):
                 return f"Error: The directory '{repo_path}' does not exist."
             pre_cmd = f"cd {safe_repo} && "
-
-        # 拦截会吞噬实时流的管道命令
-        blocked_patterns = [r'\|\s*tail\s+-\d+', r'\|\s*head\s+-\d+', r'\|\s*wc\s+-l', r'\|\s*grep\s+-c']
-        if any(re.search(pat, command) for pat in blocked_patterns):
-            return (
-                "Error: Your command contains a pipeline (e.g. | tail -10) that buffers output. "
-                "Remove the pipeline; the tool automatically truncates long output for AI context."
-            )
 
         # 2. 命令拼装
         # 移除 echo | sudo -S 管道注入，因为管道会剥夺后续命令 (如 apt) 的标准输入，导致它们遇到交互直接 EOF 中止。
@@ -101,7 +94,14 @@ def run_pty_command(command: str, header_msg: str, timeout: int = 30000, sudo_pa
             # 只替换第一个 sudo 为 sudo -k，防止复杂命令中多次验证
             final_command = command.replace("sudo ", "sudo -k ", 1)
             
-        full_cmd = f"{env_prefix}{pre_cmd}{final_command}"
+        # --- 核心修复：使用临时脚本执行，杜绝 Bash -c 的二次解析和引号碎裂 ---
+        fd, temp_script = tempfile.mkstemp(suffix=".sh", text=True)
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(final_command)
+        
+        # 组装最终命令：设置环境 -> 切换目录 -> 执行脚本 -> 捕获退出码 -> 清理脚本
+        full_cmd = f"{env_prefix}{pre_cmd} stdbuf -oL bash {temp_script}; EXIT_CODE=$?; rm -f {temp_script}; exit $EXIT_CODE"
+        
         child = pexpect.spawn('/bin/bash', ['-c', full_cmd], encoding='utf-8', codec_errors='replace', timeout=timeout)
 
         sys.stdout.write("\n")
