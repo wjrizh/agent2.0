@@ -39,6 +39,8 @@ from agent_tools.lsp_tool import LspTool
 from agent_tools.rag_tool import RagTool
 from agent_tools.browser_tool import BrowserTool
 from agent_tools.download_tool import DownloadTool
+from agent_tools.paper_tool import PaperTool
+from agent_tools.github_tool import GitHubTool
 
 # 1. 实例化管理器（当前赋予管理员权限3）
 manager = ToolManager(current_user_role=3)
@@ -72,6 +74,8 @@ manager.register(LspTool())              # <--- 新增：LSP 语法级代码智�
 manager.register(RagTool())              # <--- 新增：代码库 RAG 语义检索
 manager.register(BrowserTool())          # <--- 新增：无头浏览器上网查询
 manager.register(DownloadTool())          # <--- 新增：PTY流式文件下载
+manager.register(PaperTool())              # <--- 新增：多源论文搜索 (arXiv + Semantic Scholar + OpenAlex + CORE)
+manager.register(GitHubTool())             # <--- 新增：GitHub 仓库爬取
 
 # 3. 完美兼容：生成与旧版完全一样的 tools 字典！
 tools = manager.get_agent_tools_dict()
