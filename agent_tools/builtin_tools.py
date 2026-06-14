@@ -77,7 +77,7 @@ def run_pty_command(command: str, header_msg: str, timeout: int = 30000, sudo_pa
     child = None
     try:
         # 1. 环境准备
-        env_prefix = "export TERM=xterm; export DEBIAN_FRONTEND=noninteractive; export PYTHONUNBUFFERED=1; export GIT_TERMINAL_PROMPT=1; "
+        env_prefix = "export TERM=xterm; export DEBIAN_FRONTEND=noninteractive; export PYTHONUNBUFFERED=1; export GIT_TERMINAL_PROMPT=1; export GIT_PAGER=cat; "
         pre_cmd = ""
         
         if repo_path:
@@ -108,7 +108,6 @@ def run_pty_command(command: str, header_msg: str, timeout: int = 30000, sudo_pa
         sys.stdout.flush()
         
         # 3. 状态与缓冲区初始化
-        sudo_password_sent = False
         output_buffer = []
         tail_buffer = ""
         
@@ -142,15 +141,9 @@ def run_pty_command(command: str, header_msg: str, timeout: int = 30000, sudo_pa
                 # 自动回复机制
                 for pattern, reply in AUTO_REPLIES:
                     if re.search(pattern, clean_tail):
-                        if 'sudo' in pattern and sudo_password_sent:
-                            continue
-                        
                         child.sendline(reply)
                         output_buffer.append(f"\n[Auto reply sent by Agent: {reply}]\n")
                         
-                        if 'sudo' in pattern:
-                            sudo_password_sent = True
-                            
                         # 匹配成功后清空窗口，防止同一个提示符重复触发
                         tail_buffer = ""
                         break
@@ -853,10 +846,12 @@ class GitTool(BaseTool):
         # 防挂起保护：拦截没有 -m 的 commit
         if command.strip() in ["commit", "commit -a"]:
             return "Error: You must provide a commit message using -m, e.g., 'commit -m \"message\"'. Interactive text editors are not supported in this sandbox."
-            
+
         cmd_str = command.strip()
         if not cmd_str.startswith("git "):
             cmd_str = f"git {cmd_str}"
+        # 禁用 Git 默认分页器 (less)，防止 PTY 因等待按键翻页而卡死
+        cmd_str = f"GIT_PAGER=cat {cmd_str}"
 
         # 核心：直接调用全局 PTY 引擎
         return run_pty_command(
