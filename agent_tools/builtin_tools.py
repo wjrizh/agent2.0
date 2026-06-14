@@ -442,7 +442,17 @@ class ReadFileTool(BaseTool):
         if end_idx < total_lines:
             meta_info += f"(⚠️ Notice: File is too large and was truncated here. Please use read_file again with start_line={end_idx+1} to read the next chunk.)\n"
 
-        return meta_info + "----------------------------------------\n" + content
+        # 备份文件元数据增强
+        backup_meta = ""
+        if ".ligong_backups" in safe_path:
+            try:
+                name = os.path.basename(safe_path)
+                parts = name.rsplit('__', 3)
+                if len(parts) == 4:
+                    backup_meta = f"[Backup Meta: Time={parts[0]}, File={parts[2]}, {parts[3].replace('.bak', '')}]\n"
+            except:
+                pass
+        return meta_info + backup_meta + "----------------------------------------\n" + content
 
 # ----------------- 新增：列出目录 -----------------
 class ListDirTool(BaseTool):
@@ -482,17 +492,25 @@ class LaunchTerminalTool(BaseTool):
     }
 
     def run(self, command: str) -> str:
-        # 移除可能导致安全问题的复杂拼接
-        safe_command = command.replace("'", '"')
-        
+        import tempfile
+        import os
         try:
-            # 针对 Debian/Ubuntu 系统，调用 x-terminal-emulator 或 gnome-terminal
-            # 命令执行完毕后用 exec bash 保持窗口不自动闪退关闭
-            terminal_cmd = f"x-terminal-emulator -e \"bash -c '{safe_command}; echo \\\"\\nProgram exited. Press Enter to close...\\\"; read'\""
-            
-            # 使用 Popen 异步弹出，不阻塞主 Agent，且绝对不使用 capture_output
-            subprocess.Popen(terminal_cmd, shell=True)
-            
+            # 使用临时脚本隔离，避免引号嵌套和 bash 二次解析
+            fd, temp_script = tempfile.mkstemp(suffix=".sh", text=True)
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                f.write(command)
+            os.chmod(temp_script, 0o755)
+
+            terminal_cmd = f"x-terminal-emulator -e bash -c '{temp_script}; echo; echo \"Program exited. Press Enter to close...\"; read; rm -f {temp_script}'"
+
+            # 传递 DISPLAY 环境变量。当前环境 DISPLAY=:99 是虚拟无头显示，
+            # 真实桌面在 :0 上，直接从环境变量拿会弹到错误显示导致窗口不可见。
+            # 优先用当前 DISPLAY，若可用且为 :0 则直接用；若不可用则强制回退 :0
+            env = os.environ.copy()
+            if 'DISPLAY' not in env or env.get('DISPLAY', ':99') == ':99':
+                env['DISPLAY'] = ':0'
+            subprocess.Popen(terminal_cmd, shell=True, env=env)
+
             return f"Successfully popped up a real terminal window running: {command}. The user is now interacting with it."
         except Exception as e:
             return f"Failed to launch real terminal: {e}"
@@ -814,52 +832,8 @@ class SendEmailTool(BaseTool):
             return f"SMTP Send Error: {str(e)}"
 
 # ----------------- 核心升级：局部更新工具 -----------------
-class UpdateFileTool(BaseTool):
-    name = "update_file"
-    description = "Update a file by searching for a specific block of code and replacing it. Fails if search_block is not unique unless replace_all is true."
-    required_role = 2
-    parameters_schema = {
-        "required": ["path", "search_block", "replace_block"],
-        "properties": {
-            "path": {"type": "string", "description": "File path."},
-            "search_block": {"type": "string", "description": "The exact string currently in the file. Must be unique."},
-            "replace_block": {"type": "string", "description": "The new string to replace it with."},
-            "replace_all": {"type": "boolean", "description": "Set to true to change every instance of search_block in the file. Default is false."}
-        }
-    }
-
-    def run(self, path: str, search_block: str, replace_block: str, replace_all: bool = False) -> str:
-        safe_path = _secure_path(path)
-        
-        # 【拦截1】未经阅读直接修改
-        if safe_path not in _READ_FILES:
-            return f"Error: You MUST use the 'read_file' tool on '{path}' before attempting to edit it."
-            
-        if not os.path.exists(safe_path):
-            return f"Error: File '{path}' not found."
-            
-        with open(safe_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-            
-        occurrences = content.count(search_block)
-        
-        # 【拦截2】字符串未找到
-        if occurrences == 0:
-            return "Error: Could not find the exact search_block in the file. Ensure you preserved the exact indentation (tabs/spaces) AFTER the line number prefix from the read output."
-            
-        # 【拦截3】字符串不唯一且未开启 replace_all
-        if occurrences > 1 and not replace_all:
-            return f"Error: The search_block is not unique (found {occurrences} times). Please provide a larger string with more surrounding context to make it unique, or set 'replace_all': true."
-            
-        if replace_all:
-            new_content = content.replace(search_block, replace_block)
-        else:
-            new_content = content.replace(search_block, replace_block, 1)
-            
-        with open(safe_path, 'w', encoding='utf-8') as f:
-            f.write(new_content)
-            
-        return f"Successfully updated '{path}'. Replaced {occurrences} occurrence(s)."
+# UpdateFileTool 已重构至 file_editor.py，此处 re-export 保持向后兼容
+from .file_editor import UpdateFileTool
 
 # ----------------- 新增：Git 核心操作工具 -----------------
 class GitTool(BaseTool):

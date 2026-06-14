@@ -99,6 +99,79 @@ def get_all_tools() -> str:
         idx += 1
     return "\n".join(lines)
 
+# ========== 参数别名映射表 ==========
+_PARAM_ALIASES = {
+    "_default": {
+        "path":          ["filePath", "file_path", "filename", "file", "filepath"],
+        "command":       ["cmd", "shell_command", "bash_command"],
+        "search_block":  ["search", "old_text", "old_code", "target"],
+        "replace_block": ["replace", "new_text", "new_code", "replacement"],
+        "content":       ["text", "body", "data"],
+        "url":           ["link", "uri", "address"],
+        "to_address":    ["to", "recipient", "email"],
+        "subject":       ["title", "topic"],
+        "query":         ["search_query", "q", "keyword"],
+        "pattern":       ["regex", "regex_pattern", "search_pattern"],
+        "action":        ["method", "operation"],
+        "max_results":   ["limit", "count", "num_results"],
+        "sort_by":       ["sort", "order_by"],
+        "language":      ["lang", "programming_language"],
+    },
+    "grep_tool": {
+        "pattern": ["regex", "search_text"],
+    },
+}
+
+def _normalize_tool_args(tool_name, tool_args, tool_schema):
+    """将 AI 输出的别名参数映射为 schema 定义的标准名称"""
+    if not tool_schema or not isinstance(tool_schema, dict):
+        return tool_args
+
+    default_aliases = _PARAM_ALIASES.get("_default", {})
+    tool_aliases = _PARAM_ALIASES.get(tool_name, {})
+    normalized = {}
+    used_aliases = set()
+    mappings = []
+
+    for std_name in tool_schema.get("properties", {}).keys():
+        if std_name in tool_args:
+            normalized[std_name] = tool_args[std_name]
+        else:
+            mapped = False
+            for alias in tool_aliases.get(std_name, []):
+                if alias in tool_args and alias not in used_aliases:
+                    normalized[std_name] = tool_args[alias]
+                    used_aliases.add(alias)
+                    mappings.append(f"'{alias}'→'{std_name}'")
+                    mapped = True
+                    break
+            if not mapped:
+                for alias in default_aliases.get(std_name, []):
+                    if alias in tool_args and alias not in used_aliases:
+                        normalized[std_name] = tool_args[alias]
+                        used_aliases.add(alias)
+                        mappings.append(f"'{alias}'→'{std_name}'")
+                        break
+
+    if mappings:
+        console.print(f"[dim]ℹ [{tool_name}] mapped: {', '.join(mappings)}[/dim]")
+
+    # 校验必填参数
+    required_params = tool_schema.get("required") or []
+    missing = set(required_params) - set(normalized.keys())
+    if missing:
+        raise ValueError(
+            f"Tool '{tool_name}' missing required parameters: {missing}. "
+            f"Received arguments: {list(tool_args.keys())}"
+        )
+
+    # 清洗字符串参数中的物理换行符
+    for key in normalized:
+        if isinstance(normalized[key], str):
+            normalized[key] = normalized[key].replace('\r\n', '\n')
+
+    return normalized
+
 def generate_system_prompt() -> str:
     """生成 System Prompt"""
     base_prompt = f"""Your name is 力工. You are a secure local developer agent.
@@ -112,6 +185,8 @@ Rules:
 4. End tasks with "Final Answer:". For casual chat, reply without JSON.
 5. The current month is {current_month}.
 6. Role (SysDev): Practice "Minimalist Modification". Prefer update_file, never modify unread code. Maintain MEMORY.md <200 lines. Use tasks/plans for complex work. RAG+LSP: When exploring unfamiliar code, use rag_tool (semantic search) to locate relevant files first, then lsp_tool (hover/definition/references) for deep analysis. If the RAG index is missing, build it with rag_tool action='build' first.
+7. update_file anchor rule: When replacing code with nested escapes (f-strings, shell commands), keep search_block minimal — a unique 1-2 line anchor (function signature, unique comment, variable name) free of backslashes/quotes. Avoid anchors with dynamic content (timestamps, random numbers, env vars). The tool auto-handles fuzzy matching.
+8. Backup & Rollback: Before every update_file action, the system automatically creates a backup in ~/.ligong_backups/. If you suspect a mistake, use list_dir ~/.ligong_backups/ to check versions, read the filename metadata (time, total lines, diff range), and use execute_bash with cp to restore the correct file. After restoring, re-read the file before making further edits.
 """
 
     tools_str = get_all_tools()
@@ -832,6 +907,15 @@ def run_agent(user_prompt):
                             else:
                                 exclude_keys = ["tool", "action", "name", "args", "params", "arguments", "parameters", "thought", "thinking"]
                                 tool_args = {k: v for k, v in act.items() if k not in exclude_keys}
+
+                            # 参数别名规范化（在白名单过滤之前）
+                            if tool_name in manager.tools:
+                                tool_schema = manager.tools[tool_name].parameters_schema
+                                try:
+                                    tool_args = _normalize_tool_args(tool_name, tool_args, tool_schema)
+                                except ValueError as e:
+                                    observations.append(f"Argument Error: {str(e)}")
+                                    continue
 
                             if tool_name in tools:
                                 # -------- 核心防御：白名单严格过滤幻觉参数 --------
