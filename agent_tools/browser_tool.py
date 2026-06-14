@@ -385,9 +385,84 @@ class BrowserTool(BaseTool):
 
                     # ==================== Action: Sniff ====================
                     elif action == "sniff":
-                        click_selector = kwargs.get("click_selector")
-                        target_pattern = kwargs.get("target_pattern")
-                        if not all([url, click_selector, target_pattern]): return "Error: url, click_selector, target_pattern required."
+                        click_selector = kwargs.get("click_selector", "")
+                        target_pattern = kwargs.get("target_pattern", "")
+                        sniff_timeout = kwargs.get("timeout", 5000)
+                        
+                        if not url or not target_pattern:
+                            return "Error: 'url' and 'target_pattern' are required."
+                        if not url.startswith("http"): url = "https://" + url
+
+                        captured_urls = set()
+
+                        def is_match(text):
+                            if not text: return False
+                            try:
+                                if re.search(target_pattern, text, re.IGNORECASE): return True
+                            except re.error:
+                                pass
+                            return target_pattern.lower() in text.lower()
+
+                        context.on("request", lambda req: captured_urls.add(req.url) if is_match(req.url) else None)
+
+                        def handle_response(res):
+                            if is_match(res.url): captured_urls.add(res.url)
+                            loc = res.headers.get("location") or res.headers.get("Location")
+                            if loc and is_match(loc): captured_urls.add(loc)
+                        context.on("response", handle_response)
+
+                        def handle_download(dl):
+                            if is_match(dl.url): captured_urls.add(dl.url)
+                            if dl.suggested_filename and is_match(dl.suggested_filename):
+                                captured_urls.add(f"{dl.url} (文件: {dl.suggested_filename})")
+                        page_instance.on("download", handle_download)
+
+                        context.on("page", lambda p: captured_urls.add(p.url) if is_match(p.url) else None)
+
+                        page_instance.goto(url, wait_until="domcontentloaded", timeout=20000)
+                        page_instance.wait_for_timeout(random.randint(500, 1000))
+                        HumanSimulator.random_scroll(page_instance, times=1)
+
+                        if click_selector:
+                            actual_selector = click_selector if any(c in click_selector for c in ['#', '.', '[', '>', ' ', ':']) or click_selector.startswith('text=') else f'text="{click_selector}"'
+                            
+                            try:
+                                target_btn = page_instance.locator(actual_selector).first
+                                target_btn.wait_for(state="attached", timeout=3000)
+
+                                found_in_dom = None
+                                for attr in ['data-url', 'data-href', 'data-link', 'data-download', 'href', 'url']:
+                                    try:
+                                        val = target_btn.get_attribute(attr)
+                                        if is_match(val):
+                                            found_in_dom = val
+                                            if not found_in_dom.startswith("http") and not found_in_dom.startswith("magnet:") and not found_in_dom.startswith("blob:"):
+                                                parsed = urllib.parse.urlparse(page_instance.url)
+                                                found_in_dom = f"{parsed.scheme}://{parsed.netloc}{found_in_dom if found_in_dom.startswith('/') else '/' + found_in_dom}"
+                                            break
+                                    except: pass
+
+                                if found_in_dom:
+                                    captured_urls.add(found_in_dom)
+                                else:
+                                    target_btn.scroll_into_view_if_needed()
+                                    page_instance.wait_for_timeout(500)
+                                    HumanSimulator.move_mouse(page_instance, target_btn)
+                                    target_btn.click(force=True)
+                            except Exception as e:
+                                return f"=== 🕵️ 嗅探异常 ===\n无法定位或点击选择器 '{click_selector}'，详细错误: {str(e)}"
+
+                        try:
+                            page_instance.wait_for_load_state('networkidle', timeout=sniff_timeout)
+                        except:
+                            page_instance.wait_for_timeout(sniff_timeout)
+
+                        if captured_urls:
+                            result_list = "\n".join([f"- {u}" for u in captured_urls])
+                            mode_text = "主动点击" if click_selector else "被动监听"
+                            result_output = f"=== 🕵️ 嗅探成功 ({mode_text}) ===\n目标: {url}\n捕获链接:\n{result_list}"
+                        else:
+                            result_output = f"=== 🕵️ 嗅探无结果 ===\n未拦截到匹配 '{target_pattern}' 的请求或响应。"
                         if not url.startswith("http"): url = "https://" + url
 
                         captured_urls = set()
