@@ -25,7 +25,7 @@ UA_POOL = [
 
 # 1x1 透明 GIF，用于拦截并 Mock 图片请求
 TRANSPARENT_GIF = b"R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
-SESSION_DIR = "./browser_sessions"
+SESSION_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "browser_sessions")
 os.makedirs(SESSION_DIR, exist_ok=True)
 
 class XvfbManager:
@@ -135,15 +135,16 @@ class HumanSimulator:
 
 class BrowserTool(BaseTool):
     name = "browser_tool"
-    description = "Automated web browser for searching or reading web pages with extreme human-like evasion. Actions: 'search' (Bing/Baidu), 'goto' (read specific URL), 'search_magnet', 'sniff'. Supports 'session_id' for persistence."
+    description = "Automated web browser for searching or reading web pages with extreme human-like evasion. Actions: 'search' (Bing/Baidu), 'goto' (read specific URL), 'sniff'. Supports 'session_id' for persistence."
     parameters_schema = {
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["search", "goto", "search_magnet", "sniff"]},
+            "action": {"type": "string", "enum": ["search", "goto", "sniff", "login"]},
             "query": {"type": "string"},
             "url": {"type": "string"},
             "page": {"type": "integer"},
             "session_id": {"type": "string", "description": "Optional ID to persist cookies/storage across calls."},
+            "credentials": {"type": "string", "description": "Optional. Name of saved credentials file (without .json extension) from a previous login action. When provided, the browser session will use the saved cookies/storage from browser_sessions/{name}.json."},
             "click_selector": {"type": "string"},
             "target_pattern": {"type": "string"}
         },
@@ -205,7 +206,30 @@ class BrowserTool(BaseTool):
         HumanSimulator.random_scroll(page, times=1)
 
     def run(self, action: str, query: str = "", url: str = "", page: int = 1, session_id: str = None, **kwargs) -> str:
-        state_path = os.path.join(SESSION_DIR, f"{session_id}.json") if session_id else None
+        # ==================== 性能优化：Login 动作尽早返回 ====================
+        if action == "login":
+            if not url:
+                return "Error: 'url' required for login. Please provide the login page URL."
+            session_name = session_id or "default_login"
+            import sys
+            python_exe = sys.executable
+            login_script_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "browser_login.py"))
+            return (
+                f"🔐 需要启动有头浏览器进行登录。\n"
+                f"请调用 launch_terminal 执行以下命令：\n"
+                f"{python_exe} {login_script_path} --url '{url}' --session-name '{session_name}'\n"
+                f"用户完成登录后，凭证将保存为 '{session_name}'。\n"
+                f"之后在 search/goto 等动作中传入 credentials='{session_name}' 即可使用已登录状态。"
+            )
+
+        # credentials 参数优先：指定已保存的凭证文件名
+        credentials = kwargs.get("credentials", "")
+        if credentials:
+            state_path = os.path.join(SESSION_DIR, f"{credentials}.json")
+            if not os.path.exists(state_path):
+                return f"Error: Credentials file '{credentials}.json' not found in browser_sessions/. Use action='login' to create it first."
+        else:
+            state_path = os.path.join(SESSION_DIR, f"{session_id}.json") if session_id else None
 
         try:
             with XvfbManager() as _:
@@ -258,6 +282,11 @@ class BrowserTool(BaseTool):
                         try:
                             self._human_search(page_instance, "bing", query)
                             
+                            # ⬇️ 重定向检测 ⬇️
+                            current_url = page_instance.url.lower()
+                            if "/login" in current_url or "/signin" in current_url:
+                                return "Error: Credentials expired or invalid. Redirected to login page. Please use action='login' to renew the session."
+
                             # 翻页逻辑复用
                             if current_page > 1:
                                 for current_idx in range(1, current_page):
@@ -300,6 +329,12 @@ class BrowserTool(BaseTool):
                         except Exception as e:
                             print(f"[BrowserTool] Bing 失败，切百度 ({str(e)})")
                             self._human_search(page_instance, "baidu", query)
+                            
+                            # ⬇️ 重定向检测 ⬇️
+                            current_url = page_instance.url.lower()
+                            if "/login" in current_url or "/signin" in current_url:
+                                return "Error: Credentials expired or invalid. Redirected to login page. Please use action='login' to renew the session."
+
                             try:
                                 page_instance.wait_for_selector("#content_left", timeout=3000)
                                 html_content = page_instance.inner_html('#content_left')
@@ -319,6 +354,11 @@ class BrowserTool(BaseTool):
                         
                         page_instance.goto(url, wait_until="domcontentloaded", timeout=20000)
                         page_instance.wait_for_timeout(random.randint(500, 800))
+
+                        # ⬇️ 重定向检测 ⬇️
+                        current_url = page_instance.url.lower()
+                        if "/login" in current_url or "/signin" in current_url:
+                            return "Error: Credentials expired or invalid. Redirected to login page. Please use action='login' to renew the session."
 
                         current_page = max(1, page)
                         if current_page > 1:
@@ -463,46 +503,7 @@ class BrowserTool(BaseTool):
                             result_output = f"=== 🕵️ 嗅探成功 ({mode_text}) ===\n目标: {url}\n捕获链接:\n{result_list}"
                         else:
                             result_output = f"=== 🕵️ 嗅探无结果 ===\n未拦截到匹配 '{target_pattern}' 的请求或响应。"
-                        if not url.startswith("http"): url = "https://" + url
 
-                        captured_urls = set()
-                        context.on("request", lambda req: captured_urls.add(req.url) if target_pattern.lower() in req.url.lower() else None)
-
-                        page_instance.goto(url, wait_until="domcontentloaded", timeout=20000)
-                        page_instance.wait_for_timeout(random.randint(500, 1000))
-                        HumanSimulator.random_scroll(page_instance, times=1)
-
-                        actual_selector = click_selector if any(c in click_selector for c in ['#', '.', '[', '>', ' ', ':']) or click_selector.startswith('text=') else f'text="{click_selector}"'
-                        target_btn = page_instance.locator(actual_selector).first
-
-                        # DOM 静默提取
-                        found_in_dom = None
-                        for attr in ['data-url', 'data-href', 'data-link', 'data-download', 'href', 'url']:
-                            try:
-                                val = target_btn.get_attribute(attr)
-                                if val and target_pattern.lower() in val.lower():
-                                    found_in_dom = val
-                                    if not found_in_dom.startswith("http") and not found_in_dom.startswith("magnet:"):
-                                        parsed = urllib.parse.urlparse(page_instance.url)
-                                        found_in_dom = f"{parsed.scheme}://{parsed.netloc}{found_in_dom if found_in_dom.startswith('/') else '/' + found_in_dom}"
-                                    break
-                            except: pass
-
-                        if found_in_dom:
-                            captured_urls.add(found_in_dom)
-                        else:
-                            # 没找到则强制物理点击嗅探
-                            target_btn.scroll_into_view_if_needed()
-                            page_instance.wait_for_timeout(500)
-                            HumanSimulator.move_mouse(page_instance, target_btn)
-                            target_btn.click(force=True)
-                            page_instance.wait_for_timeout(4000)
-
-                        if captured_urls:
-                            result_list = "\n".join([f"- {u}" for u in captured_urls])
-                            result_output = f"=== 🕵️ 嗅探成功 ===\n目标: {url}\n捕获链接:\n{result_list}"
-                        else:
-                            result_output = f"=== 🕵️ 嗅探无结果 ===\n未拦截到包含 '{target_pattern}' 的请求。"
 
                     # ==================== 状态保存与结束 ====================
                     if state_path:

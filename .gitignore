@@ -61,4 +61,5 @@ start_wang.sh
 ligong.egg-info/
 
 # 忽略 RAG 索引（本地重建即可，体积大）
-.ligong_index/
+.ligong_index/browser_sessions/
+agent_tools/.marscode/
