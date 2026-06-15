@@ -135,18 +135,19 @@ class HumanSimulator:
 
 class BrowserTool(BaseTool):
     name = "browser_tool"
-    description = "Automated web browser for searching or reading web pages with extreme human-like evasion. Actions: 'search' (Bing/Baidu), 'goto' (read specific URL), 'sniff'. Supports 'session_id' for persistence."
+    description = "Automated web browser for searching or reading web pages with extreme human-like evasion. Actions: 'search' (Bing/Baidu), 'goto' (read specific URL), 'sniff', 'snapshot' (accessibility tree). Supports 'session_id' for persistence."
     parameters_schema = {
         "type": "object",
         "properties": {
-"action": {"type": "string", "enum": ["search", "goto", "sniff", "login", "download"]},
+	"action": {"type": "string", "enum": ["search", "goto", "sniff", "login", "download", "snapshot"]},
             "query": {"type": "string"},
             "url": {"type": "string"},
             "page": {"type": "integer"},
             "session_id": {"type": "string", "description": "Optional ID to persist cookies/storage across calls."},
             "credentials": {"type": "string", "description": "Optional. Name of saved credentials file (without .json extension) from a previous login action. When provided, the browser session will use the saved cookies/storage from browser_sessions/{name}.json."},
             "click_selector": {"type": "string"},
-            "target_pattern": {"type": "string"}
+            "target_pattern": {"type": "string"},
+            "intercept_rules": {"type": "array", "description": "Optional custom network routing rules.", "items": {"type": "object"}}
         },
         "required": ["action"]
     }
@@ -173,6 +174,100 @@ class BrowserTool(BaseTool):
             route.abort() # 阻断大体积音视频
         else:
             route.continue_()
+
+    def _get_accessibility_snapshot(self, page) -> str:
+        """获取页面的无障碍树 (双引擎架构：原生 A11y + JS Fallback)"""
+        error_msg = ""
+        try:
+            # 引擎 1：尝试 Playwright 原生无障碍树
+            snapshot = page.accessibility.snapshot()
+            if snapshot:
+                lines = []
+                def walk(node, depth=0):
+                    role = node.get("role", "unknown")
+                    name = node.get("name", "")
+                    indent = "  " * depth
+                    if name:
+                        safe_name = name.replace('"', '\\"').replace('\n', ' ')
+                        hint = f"selector='role={role}[name=\"{safe_name}\"]'"
+                        if role in ["button", "link", "textbox", "searchbox", "checkbox", "combobox"]:
+                            lines.append(f"{indent}- [{role}] \"{name}\"  🎯 {hint}")
+                        else:
+                            lines.append(f"{indent}- [{role}] \"{name}\"")
+                    else:
+                        lines.append(f"{indent}- [{role}]")
+                    for child in node.get("children", []):
+                        walk(child, depth + 1)
+                walk(snapshot)
+                return "\n".join(lines)
+        except Exception as e:
+            error_msg = str(e)
+
+        # 引擎 2：兜底机制。如果 Xvfb 环境导致原生 A11y 崩溃，用 JS 强行提取交互树
+        fallback_js = """(errMsg) => {
+            const interactives = document.querySelectorAll('a, button, input, textarea, [role="button"], [role="link"], [role="tab"]');
+            let res = [];
+            interactives.forEach(el => {
+                const rect = el.getBoundingClientRect();
+                // 必须在可视区域内才提取
+                if (rect.width > 0 && rect.height > 0) {
+                    let name = (el.innerText || el.value || el.placeholder || el.getAttribute('aria-label') || el.title || '').replace(/\\s+/g, ' ').trim();
+                    if (name) {
+                        let role = el.getAttribute('role') || el.tagName.toLowerCase();
+                        if (role === 'a') role = 'link';
+
+                        // 防止超长文本撑爆 Token
+                        if (name.length > 50) name = name.substring(0, 47) + '...';
+
+                        let safe_name = name.replace(/"/g, '\\\\\"');
+                        res.push(`- [${role}] "${name}"  🎯 selector='role=${role}[name="${safe_name}"]'`);
+                    }
+                }
+            });
+            return "⚠️ Native A11y Failed (" + errMsg + "). Using JS DOM Fallback:\\n" + res.join('\\n');
+        }"""
+        try:
+            return page.evaluate(fallback_js, error_msg)
+        except Exception as fallback_e:
+            return f"(Accessibility tree and Fallback both failed: {str(fallback_e)})"
+
+    def _create_route_interceptor(self, intercept_rules: list):
+        """生成高性能可配置路由拦截器（预编译正则）"""
+        compiled_rules = []
+        for rule in (intercept_rules or []):
+            comp_rule = rule.copy()
+            if "url_pattern" in comp_rule:
+                comp_rule["url_pattern"] = re.compile(comp_rule["url_pattern"])
+            compiled_rules.append(comp_rule)
+        def interceptor(route):
+            rt = route.request.resource_type
+            url = route.request.url
+            for r in compiled_rules:
+                if "type" in r and r["type"] != rt:
+                    continue
+                if "url_pattern" in r and not r["url_pattern"].search(url):
+                    continue
+                action = r.get("action")
+                if action == "abort":
+                    route.abort()
+                    return
+                elif action == "mock":
+                    body = r.get("body", TRANSPARENT_GIF)
+                    if isinstance(body, str):
+                        body = body.encode('utf-8')
+                    route.fulfill(body=body, content_type=r.get("content_type", "image/gif"), status=r.get("status", 200))
+                    return
+                elif action == "modify_headers":
+                    new_headers = {**route.request.headers, **r.get("headers", {})}
+                    route.continue_(headers=new_headers)
+                    return
+            if rt == "image":
+                route.fulfill(body=TRANSPARENT_GIF, content_type="image/gif")
+            elif rt == "media":
+                route.abort()
+            else:
+                route.continue_()
+        return interceptor
 
     def _human_search(self, page, engine, query):
         """会话预热与拟人化搜索主流程"""
@@ -259,11 +354,12 @@ class BrowserTool(BaseTool):
                     browser = p.chromium.launch(
                         headless=False,
                         args=[
-                            '--no-sandbox', 
+                            '--no-sandbox',
                             '--disable-setuid-sandbox',
                             '--disable-blink-features=AutomationControlled',
                             '--disable-infobars',
-                            '--window-size=1366,768'
+                            '--window-size=1366,768',
+                            '--force-renderer-accessibility'
                         ]
                     )
                     
@@ -288,7 +384,8 @@ class BrowserTool(BaseTool):
                     # 🚀 修复点 2：使用新的 Stealth 类方法应用隐身策略
                     Stealth().apply_stealth_sync(page_instance)
                     
-                    page_instance.route("**/*", self._route_interceptor)
+                    custom_rules = kwargs.get("intercept_rules", [])
+                    page_instance.route("**/*", self._create_route_interceptor(custom_rules))
 
                     result_output = ""
 
@@ -602,6 +699,27 @@ class BrowserTool(BaseTool):
                         except Exception as e:
                             return f"=== 📥 下载触发超时或失败 ===\n详细错误: {str(e)}"
 
+
+                    # ==================== Action: Snapshot (无障碍树) ====================
+                    elif action == "snapshot":
+                        if not url: return "Error: 'url' required."
+                        if not url.startswith("http"): url = "https://" + url
+
+                        # 1. 基础加载：确保 DOM 骨架到位
+                        page_instance.goto(url, wait_until="domcontentloaded", timeout=20000)
+
+                        # 2. 增强等待：针对 B站/淘宝 等重度 SPA，尝试等待网络空闲，让 JS 渲染出真实内容
+                        try:
+                            page_instance.wait_for_load_state("networkidle", timeout=5000)
+                        except:
+                            pass # 超时无妨，拦截器可能导致一直有轮询请求
+
+                        # 3. 兜底等待：无障碍树 (A11y Tree) 的计算通常比 DOM 晚几百毫秒，给浏览器内核一点时间
+                        page_instance.wait_for_timeout(random.randint(1500, 2500))
+
+                        # 4. 提取并返回
+                        tree_text = self._get_accessibility_snapshot(page_instance)
+                        result_output = f"=== Accessibility Tree for {url} ===\n{tree_text}\n---\n[System] Use the 🎯 selectors directly for your next click/input actions."
 
                     # ==================== 状态保存与结束 ====================
                     if save_state_path:
