@@ -309,9 +309,9 @@ class ExecuteBashTool(BaseTool):
     }
 
     def run(self, command: str, sudo_password: str = None, interactive: bool = False) -> str:
-        forbidden_patterns = ["rm -rf /", "rm -rf *", "rm -fr /", "rm -fr *", "rm -rf .", "rm -rf /*"]
+        forbidden_patterns = [r"rm -rf /$", r"rm -rf /\s", r"rm -rf \*", r"rm -fr /$", r"rm -fr /\s", r"rm -fr \*", r"rm -rf \.", r"rm -rf /\*"]
         normalized_cmd = command.lower().replace("  ", " ")
-        if any(p in normalized_cmd for p in forbidden_patterns):
+        if any(re.search(p, normalized_cmd) for p in forbidden_patterns):
              raise SecurityError("Safety Block: Destructive command 'rm -rf' on root/wildcard detected.")
 
         def _is_gui_app(cmd: str) -> bool:

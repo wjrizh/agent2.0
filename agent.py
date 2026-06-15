@@ -403,7 +403,7 @@ def ask_user_permission(tool_name: str, tool_args: dict) -> str:
         if tool_name == "execute_bash":
             command = tool_args.get("command", "").lower().replace("  ", " ")
             for blocked in FEARLESS_BLACKLIST:
-                if blocked in command:
+                if command == blocked or command.startswith(blocked + " ") or (" " + blocked + " ") in command:
                     return f"No (Blocked by Fearless Mode: '{blocked}' is forbidden)"
         return "Yes"
     
