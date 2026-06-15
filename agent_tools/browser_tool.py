@@ -206,30 +206,49 @@ class BrowserTool(BaseTool):
         HumanSimulator.random_scroll(page, times=1)
 
     def run(self, action: str, query: str = "", url: str = "", page: int = 1, session_id: str = None, **kwargs) -> str:
-        # ==================== 性能优化：Login 动作尽早返回 ====================
+        # ==================== Login 动作：自动弹窗，一步到位 ====================
         if action == "login":
             if not url:
                 return "Error: 'url' required for login. Please provide the login page URL."
             session_name = session_id or "default_login"
             import sys
+            import tempfile
             python_exe = sys.executable
             login_script_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "browser_login.py"))
-            return (
-                f"🔐 需要启动有头浏览器进行登录。\n"
-                f"请调用 launch_terminal 执行以下命令：\n"
-                f"{python_exe} {login_script_path} --url '{url}' --session-name '{session_name}'\n"
-                f"用户完成登录后，凭证将保存为 '{session_name}'。\n"
-                f"之后在 search/goto 等动作中传入 credentials='{session_name}' 即可使用已登录状态。"
-            )
+            command = f"{python_exe} {login_script_path} --url '{url}' --session-name '{session_name}'"
+            try:
+                fd, temp_script = tempfile.mkstemp(suffix=".sh", text=True)
+                with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                    f.write(command)
+                os.chmod(temp_script, 0o755)
+                terminal_cmd = f"x-terminal-emulator -e bash -c '{temp_script}; echo; echo \"Program exited. Press Enter to close...\"; read; rm -f {temp_script}'"
+                env = os.environ.copy()
+                if 'DISPLAY' not in env or env.get('DISPLAY', ':99') == ':99':
+                    env['DISPLAY'] = ':0'
+                subprocess.Popen(terminal_cmd, shell=True, env=env)
+                return (
+                    f"✅ 登录窗口已在真实终端中弹出。\n"
+                    f"请提示用户在弹出的窗口中完成登录操作，并等待用户确认。\n"
+                    f"登录凭证将自动保存为 '{session_name}'。\n"
+                    f"之后在 action='search' 或 'goto' 时，传入 credentials='{session_name}' 即可使用该登录态。"
+                )
+            except Exception as e:
+                return f"Error: Failed to launch login terminal: {e}"
 
-        # credentials 参数优先：指定已保存的凭证文件名
+        # 修复：分离凭证加载路径与会话保存路径，避免污染原始登录凭证
         credentials = kwargs.get("credentials", "")
+        load_state_path = None
+        save_state_path = None
         if credentials:
-            state_path = os.path.join(SESSION_DIR, f"{credentials}.json")
-            if not os.path.exists(state_path):
+            load_state_path = os.path.join(SESSION_DIR, f"{credentials}.json")
+            if not os.path.exists(load_state_path):
                 return f"Error: Credentials file '{credentials}.json' not found in browser_sessions/. Use action='login' to create it first."
+            if session_id:
+                save_state_path = os.path.join(SESSION_DIR, f"{session_id}.json")
         else:
-            state_path = os.path.join(SESSION_DIR, f"{session_id}.json") if session_id else None
+            if session_id:
+                load_state_path = os.path.join(SESSION_DIR, f"{session_id}.json")
+                save_state_path = load_state_path
 
         try:
             with XvfbManager() as _:
@@ -253,8 +272,8 @@ class BrowserTool(BaseTool):
                         "viewport": {'width': 1366, 'height': 768},
                         "user_agent": current_ua
                     }
-                    if state_path and os.path.exists(state_path):
-                        context_kwargs["storage_state"] = state_path
+                    if load_state_path and os.path.exists(load_state_path):
+                        context_kwargs["storage_state"] = load_state_path
 
                     context = browser.new_context(**context_kwargs)
                     
@@ -506,8 +525,8 @@ class BrowserTool(BaseTool):
 
 
                     # ==================== 状态保存与结束 ====================
-                    if state_path:
-                        context.storage_state(path=state_path)
+                    if save_state_path:
+                        context.storage_state(path=save_state_path)
 
                     browser.close()
                     return result_output

@@ -61,7 +61,7 @@ class WriteFileTool(BaseTool):
 
 # ----------------- 全局 PTY 执行引擎 (专治进度条吞字、交互式卡死与僵尸进程) -----------------
 # ----------------- 全局 PTY 执行引擎 -----------------
-def run_pty_command(command: str, header_msg: str, timeout: int = 30000, sudo_password: str = None, repo_path: str = None, interactive: bool = False) -> str:
+def run_pty_command(command: str, header_msg: str, timeout: int = 60, sudo_password: str = None, repo_path: str = None, interactive: bool = False) -> str:
     """全局 PTY (伪终端) 执行引擎，处理进度条覆写、交互式提权与超时控制"""
     import os
     import signal
@@ -298,7 +298,7 @@ class ExecuteBashTool(BaseTool):
     name = "execute_bash"
     description = "Run shell commands. Uses a pseudo-terminal (PTY) to stream output and capture results (including exit codes) for AI. Perfect for apt/pip installs. Set interactive=true for commands that require continuous real-time keyboard input (e.g., setup wizards)."
     required_role = 3
-    timeout = 30000
+    timeout = 60
     parameters_schema = {
         "required": ["command"],
         "properties": {

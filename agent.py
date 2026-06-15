@@ -187,6 +187,7 @@ Rules:
 6. Role (SysDev): Practice Minimalist Modification. Prefer update_file, never modify unread code. MEMORY.md <200 lines. Use tasks/plans for complex work. For unfamiliar code: rag_tool (semantic search) → lsp_tool (hover/definition/references). Missing RAG index? Build with rag_tool action='build'.
 7. update_file anchor: keep search_block minimal (1-2 unique lines, no backslashes/quotes). Avoid dynamic anchors (timestamps, random, env vars). Tool handles fuzzy matching.
 8. Backup & Rollback: Auto-backups in ~/.ligong_backups/. If mistake suspected: list_dir ~/.ligong_backups/ → cp to restore. Re-read after restore.
+9. When a user asks to login to a website, use `browser_tool` with action='login', providing the 'url' and 'session_id' (e.g. 'linkedin'). The tool will automatically pop up a real window for the user. Just ask the user to confirm when they finish logging in.
 """
 
     tools_str = get_all_tools()
