@@ -61,7 +61,7 @@ class WriteFileTool(BaseTool):
 
 # ----------------- 全局 PTY 执行引擎 (专治进度条吞字、交互式卡死与僵尸进程) -----------------
 # ----------------- 全局 PTY 执行引擎 -----------------
-def run_pty_command(command: str, header_msg: str, timeout: int = 30000, sudo_password: str = None, repo_path: str = None) -> str:
+def run_pty_command(command: str, header_msg: str, timeout: int = 30000, sudo_password: str = None, repo_path: str = None, interactive: bool = False) -> str:
     """全局 PTY (伪终端) 执行引擎，处理进度条覆写、交互式提权与超时控制"""
     import os
     import signal
@@ -106,75 +106,123 @@ def run_pty_command(command: str, header_msg: str, timeout: int = 30000, sudo_pa
 
         sys.stdout.write("\n")
         sys.stdout.flush()
-        
+
         # 3. 状态与缓冲区初始化
         output_buffer = []
         tail_buffer = ""
-        
+
         # 4. 主监听循环
+        import select
+        import termios
+        import tty
+        import time
+        import os
+
+        fd = sys.stdin.fileno()
+        old_settings = None
+        if interactive:
+            old_settings = termios.tcgetattr(fd)
+            tty.setraw(fd)
+
+        last_output_time = time.time()
+
         try:
             while True:
-                chunk = child.read_nonblocking(size=1024, timeout=timeout)
-                sys.stdout.write(chunk.replace('\r\n', '\n'))
-                sys.stdout.flush()
-                output_buffer.append(chunk)
-                
-                # 维护用于提示符匹配的滑动窗口
-                tail_buffer += chunk
-                if len(tail_buffer) > 2048:
-                    tail_buffer = tail_buffer[-1024:]
-                
-                # 清除 ANSI 色彩以保证正则匹配准确
-                clean_tail = re.sub(r'\x1b\[[0-9;]*m', '', tail_buffer)
-                
-                AUTO_REPLIES = [
-                    (r'\[sudo\].*(password|密码)', sudo_password if sudo_password else 'zh030327'),
-                    (r'Proceed \([Yy]/[Nn]\)\?\s*$', 'Y'),
-                    (r'Do you want to continue\? \[[Yy]/[Nn]\]\s*$', 'Y'),
-                    (r'Is this OK\? \(yes\)\s*$', 'yes'),
-                    (r'continue connecting \(yes/no/\[fingerprint\]\)\?\s*$', 'yes'),
-                    (r'continue connecting \(yes/no\)\?\s*$', 'yes'),
-                    (r'您希望继续执行吗\？\s*\[[Yy]/[Nn]\]\s*$', 'Y'),
-                    (r'是否继续\？\s*\[[Yy]/[Nn]\]\s*$', 'Y')
-                ]
-                
-                # 自动回复机制
-                for pattern, reply in AUTO_REPLIES:
-                    if re.search(pattern, clean_tail):
-                        child.sendline(reply)
-                        output_buffer.append(f"\n[Auto reply sent by Agent: {reply}]\n")
-                        
-                        # 匹配成功后清空窗口，防止同一个提示符重复触发
-                        tail_buffer = ""
-                        break
-                
-                # 手动交互接管
-                if re.search(r'([Uu]sername|[Pp]assword|[Pp]assphrase).*:\s*$', clean_tail):
-                    is_pwd = bool(re.search(r'[Pp]assword|[Pp]assphrase', clean_tail))
-                    sys.stdout.write("\n")
-                    if is_pwd and sudo_password:
-                        child.sendline(sudo_password)
-                        output_buffer.append("\n[Auto sudo password sent]\n")
-                    elif is_pwd:
-                        user_input = getpass.getpass("\033[1;33m[🔒 进程请求密码 (你的输入不可见)] \033[0m")
-                        output_buffer.append("\n[Human Password Entered Securely]\n")
-                        child.sendline(user_input)
-                    else:
-                        user_input = input("\033[1;33m[👤 进程请求账号] \033[0m")
-                        output_buffer.append(f"\n[Human Username Entered: {user_input}]\n")
-                        child.sendline(user_input)
+                if interactive:
+                    reads, _, _ = select.select([child.child_fd, fd], [], [], 0.5)
+                else:
+                    reads, _, _ = select.select([child.child_fd], [], [], 0.5)
+
+                if not reads:
+                    if time.time() - last_output_time > timeout:
+                        raise pexpect.TIMEOUT("Timeout exceeded")
                     continue
-                    
-        except pexpect.EOF:
-            pass
-        except pexpect.TIMEOUT:
-            sys.stdout.write(f"\n\033[1;31m[执行超时 ({timeout}s)]\033[0m\n")
-            output_buffer.append(f"\n[Execution Timed Out after {timeout}s]")
+
+                if child.child_fd in reads:
+                    try:
+                        chunk = child.read_nonblocking(size=1024, timeout=0)
+                        last_output_time = time.time()
+
+                        if interactive:
+                            sys.stdout.write(chunk)
+                        else:
+                            sys.stdout.write(chunk.replace('\r\n', '\n'))
+                        sys.stdout.flush()
+                        output_buffer.append(chunk)
+
+                        tail_buffer += chunk
+                        if len(tail_buffer) > 2048:
+                            tail_buffer = tail_buffer[-1024:]
+
+                        clean_tail = re.sub(r'\x1b\[[0-9;]*m', '', tail_buffer)
+
+                        AUTO_REPLIES = [
+                            (r'\[sudo\].*(password|密码)', sudo_password if sudo_password else 'zh030327'),
+                            (r'Proceed \([Yy]/[Nn]\)\?\s*$', 'Y'),
+                            (r'Do you want to continue\? \[[Yy]/[Nn]\]\s*$', 'Y'),
+                            (r'Is this OK\? \(yes\)\s*$', 'yes'),
+                            (r'continue connecting \(yes/no/\[fingerprint\]\)\?\s*$', 'yes'),
+                            (r'continue connecting \(yes/no\)\?\s*$', 'yes'),
+                            (r'您希望继续执行吗\？\s*\[[Yy]/[Nn]\]\s*$', 'Y'),
+                            (r'是否继续\？\s*\[[Yy]/[Nn]\]\s*$', 'Y')
+                        ]
+
+                        for pattern, reply in AUTO_REPLIES:
+                            if re.search(pattern, clean_tail):
+                                child.sendline(reply)
+                                output_buffer.append(f"\n[Auto reply sent by Agent: {reply}]\n")
+                                tail_buffer = ""
+                                break
+                        else:
+                            if re.search(r'([Uu]sername|[Pp]assword|[Pp]assphrase).*:\s*$', clean_tail):
+                                is_pwd = bool(re.search(r'[Pp]assword|[Pp]assphrase', clean_tail))
+
+                                if interactive and old_settings:
+                                    termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+                                sys.stdout.write("\n")
+                                if is_pwd and sudo_password:
+                                    child.sendline(sudo_password)
+                                    output_buffer.append("\n[Auto sudo password sent]\n")
+                                elif is_pwd:
+                                    user_input = getpass.getpass("\033[1;33m[🔒 进程请求密码 (你的输入不可见)] \033[0m")
+                                    output_buffer.append("\n[Human Password Entered Securely]\n")
+                                    child.sendline(user_input)
+                                else:
+                                    user_input = input("\033[1;33m[👤 进程请求账号] \033[0m")
+                                    output_buffer.append(f"\n[Human Username Entered: {user_input}]\n")
+                                    child.sendline(user_input)
+
+                                tail_buffer = ""
+
+                                if interactive and old_settings:
+                                    tty.setraw(fd)
+
+                    except pexpect.EOF:
+                        break
+                    except pexpect.TIMEOUT:
+                        pass
+
+                if interactive and fd in reads:
+                    try:
+                        user_input = os.read(fd, 1024)
+                        if user_input:
+                            if b'\x03' in user_input:
+                                raise KeyboardInterrupt
+                            child.send(user_input.decode('utf-8', errors='replace'))
+                    except OSError:
+                        pass
+
         except KeyboardInterrupt:
             output_buffer.append("\n[Execution Aborted by User via Ctrl+C]")
             raise
+        except pexpect.TIMEOUT:
+            sys.stdout.write(f"\n\033[1;31m[执行超时 ({timeout}s)]\033[0m\n")
+            output_buffer.append(f"\n[Execution Timed Out after {timeout}s]")
         finally:
-            # 安全释放进程与清理 PTY
+            if interactive and old_settings:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
             if child is not None and child.isalive():
                 try:
                     pgid = os.getpgid(child.pid)
@@ -248,24 +296,24 @@ def run_pty_command(command: str, header_msg: str, timeout: int = 30000, sudo_pa
 # ----------------- 终极解锁版：执行脚本 (支持 sudo 注入) -----------------
 class ExecuteBashTool(BaseTool):
     name = "execute_bash"
-    description = "Run shell commands. Uses a pseudo-terminal (PTY) to stream output and capture results (including exit codes) for AI. Perfect for apt/pip installs."
+    description = "Run shell commands. Uses a pseudo-terminal (PTY) to stream output and capture results (including exit codes) for AI. Perfect for apt/pip installs. Set interactive=true for commands that require continuous real-time keyboard input (e.g., setup wizards)."
     required_role = 3
-    timeout = 30000  # 安装包可能耗时较长，放宽到更久
+    timeout = 30000
     parameters_schema = {
         "required": ["command"],
         "properties": {
             "command": {"type": "string", "description": "The shell command to run."},
-            "sudo_password": {"type": "string", "description": "Optional sudo password."}
+            "sudo_password": {"type": "string", "description": "Optional sudo password."},
+            "interactive": {"type": "boolean", "description": "Set to true ONLY if the command requires continuous real-time keyboard interaction from the user. Default false. Do NOT use for full-screen TUI apps like vim/htop — use launch_terminal for those."}
         }
     }
 
-    def run(self, command: str, sudo_password: str = None) -> str:
+    def run(self, command: str, sudo_password: str = None, interactive: bool = False) -> str:
         forbidden_patterns = ["rm -rf /", "rm -rf *", "rm -fr /", "rm -fr *", "rm -rf .", "rm -rf /*"]
         normalized_cmd = command.lower().replace("  ", " ")
         if any(p in normalized_cmd for p in forbidden_patterns):
              raise SecurityError("Safety Block: Destructive command 'rm -rf' on root/wildcard detected.")
 
-        # 只拦截纯 GUI 程序
         def _is_gui_app(cmd: str) -> bool:
             lower_cmd = cmd.strip().lower()
             launchers = [
@@ -277,12 +325,12 @@ class ExecuteBashTool(BaseTool):
         if _is_gui_app(command):
             return "Error: This is a GUI app. Please use 'launch_terminal' instead."
 
-        # 核心：直接调用全局 PTY 引擎
         return run_pty_command(
             command=command,
             header_msg="",
             timeout=self.timeout,
-            sudo_password=sudo_password
+            sudo_password=sudo_password,
+            interactive=interactive
         )
 
 # ----------------- 升级版：读取文件 -----------------
