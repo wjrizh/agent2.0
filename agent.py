@@ -33,57 +33,60 @@ client = OpenAI(
 )
 
 from agent_tools.manager import ToolManager
-from agent_tools.builtin_tools import WriteFileTool, ExecuteBashTool, ReadFileTool, ListDirTool, LaunchTerminalTool, DownloadFileTool, ReadEmailTool, SendEmailTool, DeleteEmailTool, UpdateFileTool, GitTool, GlobTool, GrepTool, TaskCreateTool, TaskUpdateTool, TaskListTool, TaskGetTool, AskUserQuestionTool, SubmitPlanTool, CronCreateTool, CronListTool, CronDeleteTool, _CRON_JOBS
-
-from agent_tools.lsp_tool import LspTool
-from agent_tools.rag_tool import RagTool
+from agent_tools.builtin_tools import WriteFileTool, ExecuteBashTool, ReadFileTool, ListDirTool, LaunchTerminalTool, DownloadFileTool, ReadEmailTool, SendEmailTool, DeleteEmailTool, UpdateFileTool, GitTool, GlobTool, GrepTool, TaskCreateTool, TaskUpdateTool, TaskListTool, TaskGetTool, AskUserQuestionTool, SubmitPlanTool
 from agent_tools.browser_tool import BrowserTool
 from agent_tools.download_tool import DownloadTool
 from agent_tools.paper_tool import PaperTool
 from agent_tools.github_tool import GitHubTool
+from agent_tools.jlceda_tools import JLCEDA_MasterTool
+from jlceda_agent import get_jlceda_system_prompt
 
-# 1. 实例化管理器（当前赋予管理员权限3）
-manager = ToolManager(current_user_role=3)
+# 1. 角色工具隔离池 — 真·物理隔离
+ROLE_TOOLS_CONFIG = {
+    "dev": [
+        WriteFileTool, ExecuteBashTool, ReadFileTool, ListDirTool, LaunchTerminalTool,
+        DownloadFileTool, ReadEmailTool, SendEmailTool, DeleteEmailTool, UpdateFileTool,
+        GitTool, GlobTool, GrepTool, TaskCreateTool, TaskUpdateTool, TaskListTool, TaskGetTool,
+        AskUserQuestionTool, SubmitPlanTool,
+        BrowserTool, DownloadTool, PaperTool, GitHubTool
+    ],
+    "jlceda": [
+        JLCEDA_MasterTool,   # 嘉立创核心
+        WriteFileTool, ExecuteBashTool, ReadFileTool, ListDirTool,
+        LaunchTerminalTool, DownloadFileTool, UpdateFileTool,
+        GitTool, GlobTool, GrepTool,
+        AskUserQuestionTool, SubmitPlanTool,
+        BrowserTool, DownloadTool, PaperTool, GitHubTool
+    ]
+}
 
-# 2. 批量注册企业级工具
-manager.register(WriteFileTool())
-manager.register(ExecuteBashTool())
-manager.register(ReadFileTool())
-manager.register(ListDirTool())
-manager.register(LaunchTerminalTool())  # <--- 新增这行
-manager.register(DownloadFileTool())      # <--- 新增：网络文件下载
-manager.register(ReadEmailTool())         # <--- 新增：IMAP 邮件读取
-manager.register(SendEmailTool())          # <--- 新增：SMTP 邮件发送
-manager.register(DeleteEmailTool())        # <--- 新增：IMAP 邮件删除
-manager.register(UpdateFileTool())         # <--- 新增：局部文件更新
-manager.register(GitTool())                # <--- 新增：Git全套操作
-manager.register(GlobTool())   # <--- 新增：Glob 文件搜索
-manager.register(GrepTool())   # <--- 新增：Grep 内容搜索
-manager.register(TaskCreateTool())   # <--- 新增：任务创建
-manager.register(TaskUpdateTool())   # <--- 新增：任务更新
-manager.register(TaskListTool())     # <--- 新增：任务列表查询
-manager.register(TaskGetTool())      # <--- 新增：任务详情查询
+CURRENT_ROLE = "dev"  # 'dev' 或 'jlceda'
+manager = None
+tools = {}
 
-manager.register(AskUserQuestionTool()) # <--- 新增：注册提问交互工具
-manager.register(SubmitPlanTool()) # <--- 新增：注册计划提交工具
-manager.register(CronCreateTool())   # <--- 新增：创建定时任务
-manager.register(CronListTool())     # <--- 新增：查询定时任务
-manager.register(CronDeleteTool())   # <--- 新增：删除定时任务
+import copy
+_JLCEDA_SYSTEM_PROMPT_CACHE = None
 
-manager.register(LspTool())              # <--- 新增：LSP 语法级代码智能
-manager.register(RagTool())              # <--- 新增：代码库 RAG 语义检索
-manager.register(BrowserTool())          # <--- 新增：无头浏览器上网查询
-manager.register(DownloadTool())          # <--- 新增：PTY流式文件下载
-manager.register(PaperTool())              # <--- 新增：多源论文搜索 (arXiv + Semantic Scholar + OpenAlex + CORE)
-manager.register(GitHubTool())             # <--- 新增：GitHub 仓库爬取
+def apply_role_tools(role_name: str):
+    """动态销毁并重建工具管理器，实现 Token 物理隔离"""
+    global manager, tools
+    from agent_tools.manager import ToolManager
+    manager = ToolManager(current_user_role=3)
+    tool_classes = ROLE_TOOLS_CONFIG.get(role_name, ROLE_TOOLS_CONFIG["dev"])
+    for tool_cls in tool_classes:
+        manager.register(tool_cls())
+    tools = manager.get_agent_tools_dict()
 
-# 3. 完美兼容：生成与旧版完全一样的 tools 字典！
-tools = manager.get_agent_tools_dict()
+# 初始化默认 dev 工具池
+apply_role_tools(CURRENT_ROLE)
 
-# 4. 动态提示词与角色系统重构
 current_month = datetime.datetime.now().strftime("%Y-%m")
 
-# 全局变量：当前角色
+def get_or_create_jlceda_prompt() -> str:
+    global _JLCEDA_SYSTEM_PROMPT_CACHE
+    if _JLCEDA_SYSTEM_PROMPT_CACHE is None:
+        _JLCEDA_SYSTEM_PROMPT_CACHE = get_jlceda_system_prompt()
+    return _JLCEDA_SYSTEM_PROMPT_CACHE
 
 def get_all_tools() -> str:
     """列出所有已注册工具"""
@@ -184,9 +187,12 @@ Rules:
 3. Sudo password: 'zh030327'. Include it when needed.
 4. End tasks with "Final Answer:". For casual chat, reply without JSON.
 5. The current month is {current_month}.
-6. Role (SysDev): Practice Minimalist Modification. Prefer update_file, never modify unread code. MEMORY.md <200 lines. Use tasks/plans for complex work. For unfamiliar code: rag_tool (semantic search) → lsp_tool (hover/definition/references). Missing RAG index? Build with rag_tool action='build'.
+6. Role (SysDev): Practice Minimalist Modification. Prefer update_file, never modify unread code. MEMORY.md <200 lines. Use tasks/plans for complex work.
 7. update_file anchor: keep search_block minimal (1-2 unique lines, no backslashes/quotes). Avoid dynamic anchors (timestamps, random, env vars). Tool handles fuzzy matching.
 8. Backup & Rollback: Auto-backups in ~/.ligong_backups/. If mistake suspected: list_dir ~/.ligong_backups/ → cp to restore. Re-read after restore.
+9. When a user asks to login to a website, use `browser_tool` with action='login', providing the 'url' and 'session_id' (e.g. 'linkedin'). The tool will automatically pop up a real window for the user. Just ask the user to confirm when they finish logging in.
+10. Download Strategy (3-tier): (1) Use `browser_tool action='goto'` to read the page and extract direct download URLs. (2) If a direct URL is found, use `download_tool` (wget) to download it — this is fastest. (3) If the direct URL returns an HTML redirect page (not the actual file), fall back to `browser_tool` with `action='download'` and the appropriate `click_selector` to trigger the native browser download.
+11. Data Display Rule: When displaying JSON file contents or raw data to the user, ALWAYS wrap it in a ```text block. NEVER use ```json. The ```json block is STRICTLY reserved for tool calls.
 """
 
     tools_str = get_all_tools()
@@ -422,7 +428,7 @@ def ask_user_permission(tool_name: str, tool_args: dict) -> str:
     "write_file", "read_file", "list_dir", "task_create", "task_update",
     "task_list", "task_get", "glob_tool", "grep_tool", "submit_plan",
     "launch_terminal", "delete_email", "read_email",
-    "git_tool", "lsp_tool", "browser_tool", "debug_tool"
+"git_tool", "browser_tool", "debug_tool"
     ]
     if tool_name in safe_tools:
         return "Yes"
@@ -883,8 +889,18 @@ def run_agent(user_prompt):
                         actions = action_data if isinstance(action_data, list) else [action_data]
                         
                         for act in actions:
-                            if not (isinstance(act, dict) and any(k in act for k in ["tool", "action", "name"])):
+                            # 核心修复：严格工具调用特征检测
+                            if not isinstance(act, dict):
                                 continue
+                            
+                            # 防误触逻辑：必须包含 tool 或 action。
+                            # 如果只有 name，则必须同时带有 arguments、params 或 args，否则视为普通 JSON 数据跳过。
+                            is_tool_call = ("tool" in act) or ("action" in act) or \
+                                           ("name" in act and any(k in act for k in ["arguments", "params", "args"]))
+                            
+                            if not is_tool_call:
+                                continue  # 完美过滤掉网表里的 {"name": "R1", ...}
+                                
                             executed_any = True
                             tool_name = act.get("tool") or act.get("action") or act.get("name")
                             
@@ -1105,49 +1121,7 @@ def cleanup_everything():
         except subprocess.TimeoutExpired:
             BRIDGE_PROC.kill()
 
-# ================== 新增：定时任务后台守护进程 (Cron Daemon) ==================
-def cron_daemon():
-    global _CRON_JOBS, chat_history
-    while True:
-        time.sleep(20)
-        try:
-            from croniter import croniter
-        except ImportError:
-            continue
-
-        if not _CRON_JOBS:
-            continue
-
-        now = time.time()
-        triggered_prompts = []
-        expired_jobs = []
-
-        for jid, job in list(_CRON_JOBS.items()):
-            if now > job["expires_at"]:
-                expired_jobs.append(jid)
-                continue
-
-            if now >= job["next_run"]:
-                triggered_prompts.append((jid, job["prompt"]))
-                itr = croniter(job["cron"], now)
-                _CRON_JOBS[jid]["next_run"] = itr.get_next(float)
-
-        for jid in expired_jobs:
-            if jid in _CRON_JOBS:
-                del _CRON_JOBS[jid]
-
-        if triggered_prompts:
-            sys.stdout.write("\a")
-            with chat_history_lock:
-                for jid, prompt_text in triggered_prompts:
-                    sys.stdout.write(f"\r\033[K\n\033[1;35m[Cron {jid} Triggered!]\033[0m {prompt_text}\n")
-                    chat_history.append({"role": "user", "content": f"[System Reminder - Cron {jid} Triggered]: {prompt_text}"})
-
-            sys.stdout.write("\033[1;32m(Please press Enter to let AI process the Cron task) ❯ \033[0m")
-            sys.stdout.flush()
-
-# 启动该精灵线程 (跟随主进程同生共死)
-threading.Thread(target=cron_daemon, daemon=True).start()
+# Cron daemon 已移除
 
 # ================== 以下是全新的启动与守护逻辑 ==================
 
@@ -1173,7 +1147,7 @@ def main():
             print(f"✅ 登录状态已保存到 {state_file}")
         sys.exit(0)
 
-    global chat_history, CURRENT_EMAIL_PROFILE, BRIDGE_PROC, SYSTEM_PROMPT
+    global chat_history, CURRENT_EMAIL_PROFILE, BRIDGE_PROC, SYSTEM_PROMPT, CURRENT_ROLE
     # ================= 以下内容和原 if __name__ == "__main__" 完全一致 ================= 
     # 0. 拉起后台 (静默启动，不在第一屏抢戏) 
     if not start_and_watch_bridge(): 
@@ -1393,6 +1367,50 @@ def main():
                     console.print(f"[red]无法连接到 Bridge 服务: {e}[/red]")
                 continue
 
+
+            # ───────────────── 角色切换网关 ─────────────────
+            role_commands = ["/role", "/jlceda", "/dev", "嘉立创", "硬件工程师", "开发模式"]
+            if task.strip().lower() in role_commands or task.strip().lower().startswith("/role"):
+                task_lower = task.strip().lower()
+
+                if "jlceda" in task_lower or "嘉立创" in task_lower or "硬件" in task_lower:
+                    if CURRENT_ROLE == "jlceda":
+                        console.print("[yellow]已经是硬件大师 (嘉立创EDA) 模式。[/yellow]")
+                    else:
+                        CURRENT_ROLE = "jlceda"
+                        apply_role_tools("jlceda")
+                        SYSTEM_PROMPT = get_or_create_jlceda_prompt() + "\nAvailable Tools:\n" + get_all_tools()
+                        with chat_history_lock:
+                            chat_history.clear()
+                            chat_history.append({"role": "system", "content": SYSTEM_PROMPT + get_memory_context()})
+                            chat_history.append({"role": "system", "content": f"[ROLE SWITCH] 你已切换为硬件大师（嘉立创EDA专家）。忘记之前的开发者人设，只处理PCB设计相关任务。当前工作目录: {cwd}"})
+                            chat_history.append({"role": "system", "content": f"User trusted the folder. Your current absolute working directory is: {cwd}"})
+                        console.print("\n[bold green]🔌 已切换至: 硬件大师 (嘉立创EDA)[/bold green]")
+                        console.print("[dim]专属工具: jlceda_master + 3 基础工具 | 上下文已重置 | 人设: PCB设计专家[/dim]\n")
+
+                elif "dev" in task_lower or "开发" in task_lower or "default" in task_lower:
+                    if CURRENT_ROLE == "dev":
+                        console.print("[yellow]已经是力工 (全栈开发) 模式。[/yellow]")
+                    else:
+                        CURRENT_ROLE = "dev"
+                        apply_role_tools("dev")
+                        SYSTEM_PROMPT = generate_system_prompt()
+                        with chat_history_lock:
+                            chat_history.clear()
+                            chat_history.append({"role": "system", "content": SYSTEM_PROMPT + get_memory_context()})
+                            chat_history.append({"role": "system", "content": f"[ROLE SWITCH] 你已切换回力工（全栈开发专家）。忘记之前的硬件专家人设。当前工作目录: {cwd}"})
+                            chat_history.append({"role": "system", "content": f"User trusted the folder. Your current absolute working directory is: {cwd}"})
+                        console.print("\n[bold cyan]💻 已切换回: 力工 (全栈开发)[/bold cyan]")
+                        console.print("[dim]全工具集 (20+) 已恢复 | 上下文已重置 | 人设: 系统开发专家[/dim]\n")
+
+                else:
+                    console.print("\n[bold cyan]可用角色:[/bold cyan]")
+                    mark_j = "👈 (当前)" if CURRENT_ROLE == "jlceda" else ""
+                    mark_d = "👈 (当前)" if CURRENT_ROLE == "dev" else ""
+                    console.print(f"  [green]/jlceda[/green] : 硬件大师 (嘉立创EDA) {mark_j}")
+                    console.print(f"  [green]/dev[/green]   : 力工 (全栈开发) {mark_d}")
+                    console.print("[dim]自然语言: '嘉立创'、'硬件工程师'、'开发模式' 也可触发切换[/dim]\n")
+                continue
 
             # 无畏模式切换命令
             fearless_commands = ["/fearless", "无畏模式", "fearless mode"]

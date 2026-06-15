@@ -61,7 +61,7 @@ class WriteFileTool(BaseTool):
 
 # ----------------- 全局 PTY 执行引擎 (专治进度条吞字、交互式卡死与僵尸进程) -----------------
 # ----------------- 全局 PTY 执行引擎 -----------------
-def run_pty_command(command: str, header_msg: str, timeout: int = 30000, sudo_password: str = None, repo_path: str = None, interactive: bool = False) -> str:
+def run_pty_command(command: str, header_msg: str, timeout: int = 60, sudo_password: str = None, repo_path: str = None, interactive: bool = False) -> str:
     """全局 PTY (伪终端) 执行引擎，处理进度条覆写、交互式提权与超时控制"""
     import os
     import signal
@@ -298,7 +298,7 @@ class ExecuteBashTool(BaseTool):
     name = "execute_bash"
     description = "Run shell commands. Uses a pseudo-terminal (PTY) to stream output and capture results (including exit codes) for AI. Perfect for apt/pip installs. Set interactive=true for commands that require continuous real-time keyboard input (e.g., setup wizards)."
     required_role = 3
-    timeout = 30000
+    timeout = 60
     parameters_schema = {
         "required": ["command"],
         "properties": {
@@ -1343,86 +1343,7 @@ class AskUserQuestionTool(BaseTool):
                 return f"User selected: Other: {custom}"
             else:
                 return f"User selected: {options[selected_idx]}"
-# ----------------- 新增：内存定时任务 (Cron Scheduling) -----------------
-import time
-
-_CRON_JOBS = {}
-
-class CronCreateTool(BaseTool):
-    name = "cron_create"
-    description = "Schedule a prompt to be enqueued at a future time using standard 5-field cron. Recurring tasks auto-expire after 3 days."
-    required_role = 1
-    parameters_schema = {
-        "required": ["cron_expression", "prompt"],
-        "properties": {
-            "cron_expression": {"type": "string", "description": "Standard 5-field cron expression (e.g., '14 * * * *'). Avoid :00 and :30 minute marks."},
-            "prompt": {"type": "string", "description": "The prompt to enqueue when the time triggers."}
-        }
-    }
-
-    def run(self, cron_expression: str, prompt: str) -> str:
-        try:
-            from croniter import croniter
-        except ImportError:
-            return "Error: The 'croniter' package is missing. Please use 'execute_bash' to run `pip install croniter` first, then try scheduling again."
-        
-        if not croniter.is_valid(cron_expression):
-            return f"Error: Invalid cron expression '{cron_expression}'."
-            
-        now = time.time()
-        itr = croniter(cron_expression, now)
-        next_run = itr.get_next(float)
-        
-        job_id = f"C{int(now * 1000)}"
-        _CRON_JOBS[job_id] = {
-            "cron": cron_expression,
-            "prompt": prompt,
-            "created_at": now,
-            "next_run": next_run,
-            "expires_at": now + (3 * 24 * 3600)  # 3 days expiration
-        }
-        
-        from datetime import datetime
-        next_run_str = datetime.fromtimestamp(next_run).strftime('%Y-%m-%d %H:%M:%S')
-        return f"Cron job [{job_id}] scheduled successfully. Next run at: {next_run_str} (Local Time)."
-
-
-class CronListTool(BaseTool):
-    name = "cron_list"
-    description = "List all active cron jobs in the current session."
-    required_role = 1
-    parameters_schema = {
-        "required": [],
-        "properties": {}
-    }
-
-    def run(self) -> str:
-        if not _CRON_JOBS:
-            return "No active cron jobs."
-        from datetime import datetime
-        res = ["--- Active Session Cron Jobs ---"]
-        for jid, job in _CRON_JOBS.items():
-            next_str = datetime.fromtimestamp(job['next_run']).strftime('%Y-%m-%d %H:%M:%S')
-            res.append(f"[{jid}] Cron: '{job['cron']}' | Next: {next_str} | Prompt: '{job['prompt'][:40]}...'")
-        return "\n".join(res)
-
-
-class CronDeleteTool(BaseTool):
-    name = "cron_delete"
-    description = "Delete a scheduled cron job by its ID."
-    required_role = 1
-    parameters_schema = {
-        "required": ["job_id"],
-        "properties": {
-            "job_id": {"type": "string", "description": "The ID of the cron job to delete."}
-        }
-    }
-
-    def run(self, job_id: str) -> str:
-        if job_id in _CRON_JOBS:
-            del _CRON_JOBS[job_id]
-            return f"Cron job [{job_id}] successfully deleted."
-        return f"Error: Cron job ID '{job_id}' not found."
+# Cron 工具已移除
 
 # ----------------- 新增：计划模式工具 (Submit Plan) -----------------
 class SubmitPlanTool(BaseTool):

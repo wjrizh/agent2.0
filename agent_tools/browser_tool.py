@@ -139,7 +139,7 @@ class BrowserTool(BaseTool):
     parameters_schema = {
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["search", "goto", "sniff", "login"]},
+"action": {"type": "string", "enum": ["search", "goto", "sniff", "login", "download"]},
             "query": {"type": "string"},
             "url": {"type": "string"},
             "page": {"type": "integer"},
@@ -206,30 +206,49 @@ class BrowserTool(BaseTool):
         HumanSimulator.random_scroll(page, times=1)
 
     def run(self, action: str, query: str = "", url: str = "", page: int = 1, session_id: str = None, **kwargs) -> str:
-        # ==================== 性能优化：Login 动作尽早返回 ====================
+        # ==================== Login 动作：自动弹窗，一步到位 ====================
         if action == "login":
             if not url:
                 return "Error: 'url' required for login. Please provide the login page URL."
             session_name = session_id or "default_login"
             import sys
+            import tempfile
             python_exe = sys.executable
             login_script_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "browser_login.py"))
-            return (
-                f"🔐 需要启动有头浏览器进行登录。\n"
-                f"请调用 launch_terminal 执行以下命令：\n"
-                f"{python_exe} {login_script_path} --url '{url}' --session-name '{session_name}'\n"
-                f"用户完成登录后，凭证将保存为 '{session_name}'。\n"
-                f"之后在 search/goto 等动作中传入 credentials='{session_name}' 即可使用已登录状态。"
-            )
+            command = f"{python_exe} {login_script_path} --url '{url}' --session-name '{session_name}'"
+            try:
+                fd, temp_script = tempfile.mkstemp(suffix=".sh", text=True)
+                with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                    f.write(command)
+                os.chmod(temp_script, 0o755)
+                terminal_cmd = f"x-terminal-emulator -e bash -c '{temp_script}; echo; echo \"Program exited. Press Enter to close...\"; read; rm -f {temp_script}'"
+                env = os.environ.copy()
+                if 'DISPLAY' not in env or env.get('DISPLAY', ':99') == ':99':
+                    env['DISPLAY'] = ':0'
+                subprocess.Popen(terminal_cmd, shell=True, env=env)
+                return (
+                    f"✅ 登录窗口已在真实终端中弹出。\n"
+                    f"请提示用户在弹出的窗口中完成登录操作，并等待用户确认。\n"
+                    f"登录凭证将自动保存为 '{session_name}'。\n"
+                    f"之后在 action='search' 或 'goto' 时，传入 credentials='{session_name}' 即可使用该登录态。"
+                )
+            except Exception as e:
+                return f"Error: Failed to launch login terminal: {e}"
 
-        # credentials 参数优先：指定已保存的凭证文件名
+        # 修复：分离凭证加载路径与会话保存路径，避免污染原始登录凭证
         credentials = kwargs.get("credentials", "")
+        load_state_path = None
+        save_state_path = None
         if credentials:
-            state_path = os.path.join(SESSION_DIR, f"{credentials}.json")
-            if not os.path.exists(state_path):
+            load_state_path = os.path.join(SESSION_DIR, f"{credentials}.json")
+            if not os.path.exists(load_state_path):
                 return f"Error: Credentials file '{credentials}.json' not found in browser_sessions/. Use action='login' to create it first."
+            if session_id:
+                save_state_path = os.path.join(SESSION_DIR, f"{session_id}.json")
         else:
-            state_path = os.path.join(SESSION_DIR, f"{session_id}.json") if session_id else None
+            if session_id:
+                load_state_path = os.path.join(SESSION_DIR, f"{session_id}.json")
+                save_state_path = load_state_path
 
         try:
             with XvfbManager() as _:
@@ -253,8 +272,8 @@ class BrowserTool(BaseTool):
                         "viewport": {'width': 1366, 'height': 768},
                         "user_agent": current_ua
                     }
-                    if state_path and os.path.exists(state_path):
-                        context_kwargs["storage_state"] = state_path
+                    if load_state_path and os.path.exists(load_state_path):
+                        context_kwargs["storage_state"] = load_state_path
 
                     context = browser.new_context(**context_kwargs)
                     
@@ -505,9 +524,88 @@ class BrowserTool(BaseTool):
                             result_output = f"=== 🕵️ 嗅探无结果 ===\n未拦截到匹配 '{target_pattern}' 的请求或响应。"
 
 
+                    # ==================== Action: Download ====================
+                    elif action == "download":
+                        click_selector = kwargs.get("click_selector", "")
+                        if not url or not click_selector:
+                            return "Error: 'url' and 'click_selector' are required for download action."
+                        if not url.startswith("http"): url = "https://" + url
+
+                        page_instance.goto(url, wait_until="domcontentloaded", timeout=20000)
+                        page_instance.wait_for_timeout(random.randint(500, 1000))
+
+                        try:
+                            target_btn = page_instance.locator(click_selector).first
+                            target_btn.wait_for(state="attached", timeout=1000)
+                            target_btn.scroll_into_view_if_needed()
+                            page_instance.wait_for_timeout(500)
+                            HumanSimulator.move_mouse(page_instance, target_btn)
+                        except Exception as e:
+                            return f"=== 📥 下载异常 ===\n无法定位下载按钮 '{click_selector}': {str(e)}"
+
+                        import sys
+                        import threading
+
+                        sys.stdout.write(f"\n\033[1;36m[Browser Tool] 准备点击下载按钮: {click_selector}\033[0m\n")
+                        sys.stdout.flush()
+
+                        try:
+                            with page_instance.expect_download(timeout=60000) as download_info:
+                                target_btn.click(force=True)
+
+                            download = download_info.value
+                            suggested_filename = download.suggested_filename
+
+                            save_dir = os.path.expanduser("~/下载")
+                            os.makedirs(save_dir, exist_ok=True)
+                            final_path = os.path.join(save_dir, suggested_filename)
+
+                            sys.stdout.write(f"\033[1;33m[Browser Tool] 成功触发下载，目标文件: {suggested_filename}\033[0m\n")
+                            sys.stdout.write(f"\033[1;33m[Browser Tool] 浏览器正接管数据流，请等待...\033[0m\n")
+                            sys.stdout.flush()
+
+                            done_event = threading.Event()
+                            def spinner():
+                                spin_chars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+                                i = 0
+                                start_t = time.time()
+                                while not done_event.is_set():
+                                    elapsed = int(time.time() - start_t)
+                                    sys.stdout.write(f"\r\033[K\033[1;32m{spin_chars[i % len(spin_chars)]} 持续下载中... 已耗时 {elapsed}s\033[0m")
+                                    sys.stdout.flush()
+                                    time.sleep(0.1)
+                                    i += 1
+
+                            t = threading.Thread(target=spinner)
+                            t.start()
+
+                            error_msg = None
+                            try:
+                                download.save_as(final_path)
+                            except Exception as e:
+                                error_msg = str(e)
+                            finally:
+                                done_event.set()
+                                t.join()
+
+                            sys.stdout.write("\n")
+
+                            if error_msg:
+                                result_output = f"=== 📥 下载失败 ===\n错误详情: {error_msg}"
+                            else:
+                                file_size_mb = os.path.getsize(final_path) / (1024 * 1024)
+                                success_msg = f"=== 📥 下载成功 ===\n文件路径: {final_path}\n文件大小: {file_size_mb:.2f} MB"
+                                sys.stdout.write(f"\033[1;32m{success_msg}\033[0m\n")
+                                sys.stdout.flush()
+                                result_output = success_msg
+
+                        except Exception as e:
+                            return f"=== 📥 下载触发超时或失败 ===\n详细错误: {str(e)}"
+
+
                     # ==================== 状态保存与结束 ====================
-                    if state_path:
-                        context.storage_state(path=state_path)
+                    if save_state_path:
+                        context.storage_state(path=save_state_path)
 
                     browser.close()
                     return result_output
