@@ -40,6 +40,7 @@ from agent_tools.paper_tool import PaperTool
 from agent_tools.github_tool import GitHubTool
 from agent_tools.jlceda_tools import JLCEDA_MasterTool
 from jlceda_agent import get_jlceda_system_prompt
+from thesis_agent import get_thesis_system_prompt
 
 # 1. 角色工具隔离池 — 真·物理隔离
 ROLE_TOOLS_CONFIG = {
@@ -57,6 +58,13 @@ ROLE_TOOLS_CONFIG = {
         GitTool, GlobTool, GrepTool,
         AskUserQuestionTool, SubmitPlanTool,
         BrowserTool, DownloadTool, PaperTool, GitHubTool
+    ],
+    "thesis": [
+        WriteFileTool, ExecuteBashTool, ReadFileTool, ListDirTool, LaunchTerminalTool,
+        DownloadFileTool, UpdateFileTool,
+        GitTool, GlobTool, GrepTool, TaskCreateTool, TaskUpdateTool, TaskListTool, TaskGetTool,
+        AskUserQuestionTool, SubmitPlanTool,
+        BrowserTool, DownloadTool, PaperTool, GitHubTool
     ]
 }
 
@@ -66,6 +74,7 @@ tools = {}
 
 import copy
 _JLCEDA_SYSTEM_PROMPT_CACHE = None
+_THESIS_SYSTEM_PROMPT_CACHE = None
 
 def apply_role_tools(role_name: str):
     """动态销毁并重建工具管理器，实现 Token 物理隔离"""
@@ -87,6 +96,12 @@ def get_or_create_jlceda_prompt() -> str:
     if _JLCEDA_SYSTEM_PROMPT_CACHE is None:
         _JLCEDA_SYSTEM_PROMPT_CACHE = get_jlceda_system_prompt()
     return _JLCEDA_SYSTEM_PROMPT_CACHE
+
+def get_or_create_thesis_prompt() -> str:
+    global _THESIS_SYSTEM_PROMPT_CACHE
+    if _THESIS_SYSTEM_PROMPT_CACHE is None:
+        _THESIS_SYSTEM_PROMPT_CACHE = get_thesis_system_prompt()
+    return _THESIS_SYSTEM_PROMPT_CACHE
 
 def get_all_tools() -> str:
     """列出所有已注册工具"""
@@ -1369,7 +1384,7 @@ def main():
 
 
             # ───────────────── 角色切换网关 ─────────────────
-            role_commands = ["/role", "/jlceda", "/dev", "嘉立创", "硬件工程师", "开发模式"]
+            role_commands = ["/role", "/jlceda", "/dev", "/thesis", "嘉立创", "硬件工程师", "开发模式", "论文", "学术", "审稿"]
             if task.strip().lower() in role_commands or task.strip().lower().startswith("/role"):
                 task_lower = task.strip().lower()
 
@@ -1387,6 +1402,21 @@ def main():
                             chat_history.append({"role": "system", "content": f"User trusted the folder. Your current absolute working directory is: {cwd}"})
                         console.print("\n[bold green]🔌 已切换至: 硬件大师 (嘉立创EDA)[/bold green]")
                         console.print("[dim]专属工具: jlceda_master + 3 基础工具 | 上下文已重置 | 人设: PCB设计专家[/dim]\n")
+
+                elif "thesis" in task_lower or "论文" in task_lower or "学术" in task_lower or "审稿" in task_lower:
+                    if CURRENT_ROLE == "thesis":
+                        console.print("[yellow]已经是学术论文导师模式。[/yellow]")
+                    else:
+                        CURRENT_ROLE = "thesis"
+                        apply_role_tools("thesis")
+                        SYSTEM_PROMPT = get_or_create_thesis_prompt() + "\nAvailable Tools:\n" + get_all_tools()
+                        with chat_history_lock:
+                            chat_history.clear()
+                            chat_history.append({"role": "system", "content": SYSTEM_PROMPT + get_memory_context()})
+                            chat_history.append({"role": "system", "content": f"[ROLE SWITCH] 你已切换为学术论文导师（中文学位论文专家）。忘记之前的人设，只处理LaTeX论文编译、格式检查、逻辑审计、实验审阅、去AI痕迹等学术任务。当前工作目录: {cwd}"})
+                            chat_history.append({"role": "system", "content": f"User trusted the folder. Your current absolute working directory is: {cwd}"})
+                        console.print("\n[bold magenta]📝 已切换至: 学术论文导师 (中文LaTeX论文)[/bold magenta]")
+                        console.print("[dim]专属模块: latex-thesis-zh (14个) + paper-audit (5种模式) | 上下文已重置 | 人设: 论文学术导师[/dim]\n")
 
                 elif "dev" in task_lower or "开发" in task_lower or "default" in task_lower:
                     if CURRENT_ROLE == "dev":
@@ -1407,8 +1437,10 @@ def main():
                     console.print("\n[bold cyan]可用角色:[/bold cyan]")
                     mark_j = "👈 (当前)" if CURRENT_ROLE == "jlceda" else ""
                     mark_d = "👈 (当前)" if CURRENT_ROLE == "dev" else ""
+                    mark_t = "👈 (当前)" if CURRENT_ROLE == "thesis" else ""
                     console.print(f"  [green]/jlceda[/green] : 硬件大师 (嘉立创EDA) {mark_j}")
                     console.print(f"  [green]/dev[/green]   : 力工 (全栈开发) {mark_d}")
+                    console.print(f"  [green]/thesis[/green] : 学术论文导师 (LaTeX论文) {mark_t}")
                     console.print("[dim]自然语言: '嘉立创'、'硬件工程师'、'开发模式' 也可触发切换[/dim]\n")
                 continue
 

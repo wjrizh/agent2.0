@@ -89,6 +89,22 @@ def run_pty_command(command: str, header_msg: str, timeout: int = 60, sudo_passw
         # 2. 命令拼装
         # 移除 echo | sudo -S 管道注入，因为管道会剥夺后续命令 (如 apt) 的标准输入，导致它们遇到交互直接 EOF 中止。
         # 使用 sudo -k 强制清除缓存并触发 PTY 密码提示，依赖下方的 AUTO_REPLIES 动态输入，完美保留 stdin 供后续程序使用。
+        #
+        # --- 自动移除 tail/head/wc 管道，防止 PTY 超时 ---
+        # 这些管道会缓冲输出直到输入流关闭，导致 PTY 在中间收不到新数据而超时。
+        # PTY 自身已有 4000 字符截断保护，无需这些管道。
+        original_command = command
+        PIPE_STRIP_PATTERNS = [
+            r'\s*\|\s*tail\s+((-\d+|-n\s*\d+|-[fF])\s*)?(\s*\|.*)?$',
+            r'\s*\|\s*head\s+((-\d+|-n\s*\d+)\s*)?(\s*\|.*)?$',
+            r'\s*\|\s*wc\s+(-[lwc]\s*)*(\s*\|.*)?$',
+        ]
+        import re as cmd_re
+        command = original_command
+        for pattern in PIPE_STRIP_PATTERNS:
+            if cmd_re.search(pattern, original_command):
+                command = cmd_re.sub(pattern, '', original_command).rstrip()
+                break
         final_command = command
         if sudo_password and "sudo " in command:
             # 只替换第一个 sudo 为 sudo -k，防止复杂命令中多次验证
@@ -263,7 +279,13 @@ def run_pty_command(command: str, header_msg: str, timeout: int = 60, sudo_passw
                 
             line = line.strip()
             if line:
-                lines.append(line)
+                # 展开用 \r 覆写形成的多行进度条序列（如 apt-get 下载进度）
+                if '\r' in line:
+                    segments = [seg.strip() for seg in line.split('\r') if seg.strip()]
+                    if segments:
+                        lines.append(segments[-1])
+                else:
+                    lines.append(line)
         
         # 步骤 5.5: 组装清洗后的纯净日志，消除大面积空行
         full_output = "\n".join(lines)
@@ -287,11 +309,13 @@ def run_pty_command(command: str, header_msg: str, timeout: int = 60, sudo_passw
             )
 
         return f"Exit Code: {exit_status}\nTerminal Output:\n{full_output}"
-
-    except KeyboardInterrupt:
-        raise
     except Exception as e:
-        return f"Execution Error: {str(e)}"
+        if child is not None and child.isalive():
+            try:
+                child.close(force=True)
+            except Exception:
+                pass
+        return f"Error executing command: {type(e).__name__}: {e}"
 
 # ----------------- 终极解锁版：执行脚本 (支持 sudo 注入) -----------------
 class ExecuteBashTool(BaseTool):
